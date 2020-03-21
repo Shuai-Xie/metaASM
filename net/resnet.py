@@ -8,7 +8,6 @@ def _weights_init(m):
     classname = m.__class__.__name__
     # print(classname)
     if isinstance(m, MetaLinear) or isinstance(m, MetaConv2d):
-        # init.kaiming_normal(m.weight)
         init.kaiming_normal_(m.weight)
 
 
@@ -51,7 +50,7 @@ class ResNet32(MetaModule):
         self.in_planes = 16
 
         self.conv1 = MetaConv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = MetaBatchNorm2d(16)
+        self.bn1 = MetaBatchNorm2d(16)  # 能加速网络训练的 bn 少不了
         self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
