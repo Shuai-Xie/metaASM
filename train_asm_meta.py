@@ -168,7 +168,7 @@ steps
         get D_M by system-sampling on D_L
         form B_asm = {D_M, B_hc, B_uc}
         train n=1 iterations on B_asm
-    update D=P_L
+    update P_L
     collect {D_hc, D_uc}
 4. form D_finetune = {D_L, D_hc, D_uc}
 5. train finetune_epochs on D_finetune
