@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
-from utils import AverageMeter, to_var, asm_split_samples
-from engine.base_train import accuracy
+from utils import AverageMeter, to_var, asm_split_samples, cvt_input_var
+from engine.base_engine import accuracy
 import copy
 
 
@@ -131,7 +131,6 @@ def asm_train(unlabel_loader, model,
               epoch, print_freq, writer):
     losses = AverageMeter()
     top1 = AverageMeter()
-
     begin_step = epoch * len(unlabel_loader)
 
     model.train()
@@ -142,16 +141,21 @@ def asm_train(unlabel_loader, model,
 
     for i, (input, target) in enumerate(unlabel_loader):
         # fetch asm data from unlabel loader
-        input_var, target_var, hc_acc, hc_ratio, uc_ratio = \
+        asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio = \
             asm_split_samples(model, input, target,
                               hc_delta,
                               uc_select_fn, K)
+
         writer.add_scalars('ASM/ratios', {
             'hc_ratio': hc_ratio,
             'uc_ratio': uc_ratio
         }, global_step=begin_step + i)
         writer.add_scalar('ASM/hc_acc', hc_acc, global_step=begin_step + i)
         # 显示在 tensorboard 上，二者之和恰好为样本总数 100
+
+        # cvt np to tensor
+        input_var = cvt_input_var(asm_inputs, train=True)
+        target_var = to_var(asm_targets, requires_grad=False)
 
         output = model(input_var)
         loss = criterion(output, target_var)  # reduction='mean', [1,]
