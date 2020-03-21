@@ -2,10 +2,9 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision
 import numpy as np
-import copy
 import random
-from pprint import pprint
 from datasets.cls_datasets import CIFAR
+from pprint import pprint
 
 
 def get_cls_img_idxs_dict(ds_labels, num_classes):
@@ -13,30 +12,33 @@ def get_cls_img_idxs_dict(ds_labels, num_classes):
     parse ds_labels into each cls img idxs
     @param ds_labels: dataset labels
     @param num_classes:
-    @return: dict{ cls_idx : img_id_list,.. }
+    @return: dict{ cls_idx : img_idxs_list,.. }
     """
-    data_list_val = {}
+    cls_img_idxs = {}
     for j in range(num_classes):
-        data_list_val[j] = [i for i, label in enumerate(ds_labels) if label == j]
-    return data_list_val
+        cls_img_idxs[j] = [i for i, label in enumerate(ds_labels) if label == j]
+    return cls_img_idxs
 
 
 normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                                  std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
+
+# Process PIL.Image / np img
 transform_train = transforms.Compose([
-    transforms.ToTensor(),
     # pad, 4D input tensor, lrtb [可处理 1D,2D,3D 输入，分别对应不同 pad 输入]
     # same to np.pad, reflect 32x32 -> 40x40
-    transforms.Lambda(lambda x: F.pad(x.unsqueeze(0),
-                                      (4, 4, 4, 4), mode='reflect').squeeze()),
-    transforms.ToPILImage(),
+    transforms.ToTensor(),
+    transforms.Lambda(lambda x: F.pad(x.unsqueeze(0),  # 4D
+                                      (4, 4, 4, 4), mode='reflect').squeeze()),  # recover 3D
+    transforms.ToPILImage(),  # C x H x W tensor
     transforms.RandomCrop(32),  # 32x32
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
     normalize,
 ])
+
 transform_test = transforms.Compose([
-    transforms.ToTensor(),
+    transforms.ToTensor(),  # will div(255) to [0,1]
     normalize
 ])
 
@@ -66,16 +68,16 @@ def build_dataset(dataset, num_meta):
     else:
         raise ValueError('no such dataset!')
 
-    data_list_val = get_cls_img_idxs_dict(train_dataset.targets, num_classes)
+    cls_img_idxs = get_cls_img_idxs_dict(train_dataset.targets, num_classes)
 
     # store train/meta img idxs, for np.delete
     idx_to_meta = []
     idx_to_train = []
-    for cls_idx, img_id_list in data_list_val.items():
-        random.shuffle(img_id_list)
+    for cls_idx, img_idxs in cls_img_idxs.items():
+        random.shuffle(img_idxs)
         img_num = img_num_list[int(cls_idx)]  # 10, num_meta
-        idx_to_meta.extend(img_id_list[:img_num])  # front 10 as meta
-        idx_to_train.extend(img_id_list[img_num:])  # remain as train
+        idx_to_meta.extend(img_idxs[:img_num])  # front 10 as meta
+        idx_to_train.extend(img_idxs[img_num:])  # remain as train
 
     # judge if random.seed(args.seed) works
     # print('meta idxs:', idx_to_meta)
@@ -121,6 +123,7 @@ def get_imb_num_list(dataset, imb_factor=None, num_meta=0):
         # from class 0-9
         num = img_max * (imb_factor ** (cls_idx / (cls_num - 1.0)))
         imb_num_list.append(int(num))
+
     return imb_num_list
 
 
@@ -138,7 +141,7 @@ def get_imb_meta_test_datasets(dataset, num_classes, num_meta, imb_factor, split
 
     # used image num of each class by imb_factor
     imb_num_list = get_imb_num_list(dataset, imb_factor, num_meta)
-    print('imb_img_num:', imb_num_list)
+    # print('imb_img_num:', imb_num_list)
     # [5000, 3871, 2997, 2320, 1796, 1391, 1077, 834, 645, 500]
 
     # get img idxs of each class
@@ -146,10 +149,10 @@ def get_imb_meta_test_datasets(dataset, num_classes, num_meta, imb_factor, split
 
     # 构造不平衡数据集
     idx_to_use = []
-    for cls_idx, img_id_list in data_list.items():
-        random.shuffle(img_id_list)  # shuffle each cls img_idxs
+    for cls_idx, img_idxs in data_list.items():
+        random.shuffle(img_idxs)  # shuffle each cls img_idxs
         img_num = int(imb_num_list[int(cls_idx)] * ratio)
-        idx_to_use.extend(img_id_list[:img_num])
+        idx_to_use.extend(img_idxs[:img_num])
 
     # build imbalance dataset
     imb_train_dataset = CIFAR(
@@ -158,13 +161,13 @@ def get_imb_meta_test_datasets(dataset, num_classes, num_meta, imb_factor, split
         transform=transform_train
     )
 
-    if split and 0 < split <= 1:
+    if split and 0 < split <= 1:  # for asm
         data_list = get_cls_img_idxs_dict(imb_train_dataset.targets, num_classes)
         label_idxs = []
-        for cls_idx, img_id_list in data_list.items():
-            random.shuffle(img_id_list)
-            img_num = int(len(img_id_list) * split)
-            label_idxs.extend(img_id_list[:img_num])
+        for cls_idx, img_idxs in data_list.items():
+            random.shuffle(img_idxs)
+            img_num = int(len(img_idxs) * split)
+            label_idxs.extend(img_idxs[:img_num])
 
         # label/unlabel 均服从 imb_factor
         # label, train on this, so use transform_train
@@ -177,29 +180,50 @@ def get_imb_meta_test_datasets(dataset, num_classes, num_meta, imb_factor, split
         unlabel_dataset = CIFAR(
             data=np.delete(imb_train_dataset.data, label_idxs, axis=0),
             targets=np.delete(imb_train_dataset.targets, label_idxs, axis=0),
-            transform=transform_test  # note!
+            transform=None  # todo: to transform, just get data
         )
 
-        print('label_dataset:', len(label_dataset))
-        print('unlabel_dataset:', len(unlabel_dataset))
-        print('train_meta_dataset:', len(train_meta_dataset))
-        print('test_dataset:', len(test_dataset))
+        print_dataset_info('label_dataset:', label_dataset, num_classes)
+        print_dataset_info('unlabel_dataset:', unlabel_dataset, num_classes)
+        print_dataset_info('train_meta_dataset:', train_meta_dataset, num_classes)
+        print_dataset_info('test_dataset:', test_dataset, num_classes)
 
         return label_dataset, unlabel_dataset, train_meta_dataset, test_dataset
 
     else:
-        print('imb_train_dataset:', len(imb_train_dataset))
-        print('train_meta_dataset:', len(train_meta_dataset))
-        print('test_dataset:', len(test_dataset))
+        print_dataset_info('imb_train_dataset:', imb_train_dataset, num_classes)
+        print_dataset_info('train_meta_dataset:', train_meta_dataset, num_classes)
+        print_dataset_info('test_dataset:', test_dataset, num_classes)
 
         return imb_train_dataset, train_meta_dataset, test_dataset
 
 
-def get_cls_sample_num(targets, num_classes):
+def print_dataset_info(name, dataset, num_classes):
+    print(name, len(dataset))
+    get_per_cls_sample_num(dataset.targets, num_classes)
+
+
+def get_per_cls_sample_num(targets, num_classes):
     cls_num = {i: 0 for i in range(num_classes)}
     for i in targets:
         cls_num[i] += 1
-    pprint(cls_num)
+    print(cls_num)
+
+
+def get_per_cls_img_idxs(targets, num_classes):
+    cls_img_idxs = {i: [] for i in range(num_classes)}
+    for img_idx, cls in enumerate(targets):
+        cls_img_idxs[cls].append(img_idx)
+    pprint(cls_img_idxs)
+
+
+def get_dataset_imb(targets, num_classes):
+    cls_num = {i: 0 for i in range(num_classes)}
+    for i in targets:
+        cls_num[i] += 1
+    vals = list(cls_num.values())
+    imb = np.max(vals) / np.min(vals)
+    return imb
 
 
 def test_imb_sample_num():
@@ -213,17 +237,9 @@ def test_split_dataloader(ratio=1.):
     label_dataset, unlabel_dataset, train_meta_dataset, test_dataset = \
         get_imb_meta_test_datasets(dataset, num_classes, num_meta=0, imb_factor=10, split=0.1, ratio=ratio)
 
-    print('label')
-    get_cls_sample_num(label_dataset.targets, num_classes)
-    print('unlabel')
-    get_cls_sample_num(unlabel_dataset.targets, num_classes)
-    print('meta')
-    get_cls_sample_num(train_meta_dataset.targets, num_classes)
-    print('test')
-    get_cls_sample_num(test_dataset.targets, num_classes)
-
 
 if __name__ == '__main__':
     # test_imb_sample_num()
-    test_split_dataloader()
-    test_split_dataloader(ratio=0.1)
+    # test_split_dataloader()
+    # test_split_dataloader(ratio=0.1)
+    build_dataset('cifar10', 10)

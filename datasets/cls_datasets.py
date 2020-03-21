@@ -1,5 +1,4 @@
 from torch.utils.data import Dataset
-from PIL import Image
 
 
 class CIFAR(Dataset):
@@ -14,8 +13,7 @@ class CIFAR(Dataset):
         return len(self.data)  # images
 
     def __getitem__(self, index):
-        img, target = self.data[index], self.targets[index]
-        img = Image.fromarray(img)  # cvt to PIL
+        img, target = self.data[index], self.targets[index]  # np img (H x W x C)
 
         if self.transform is not None:
             img = self.transform(img)

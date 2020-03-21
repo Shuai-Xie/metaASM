@@ -75,7 +75,7 @@ params = [
     '--num_classes', '10',
     '--imb_factor', '1',
     # important params
-    '--num_meta', '50',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
+    '--num_meta', '10',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
     '-K', '50',  # 1/2 bs, batch uncertain samples, will rm hc in uc, so <= 50
     '-uc', 'lc',
     '--split', '0.4',
@@ -83,7 +83,7 @@ params = [
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
     '--epochs', '50',
     '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
-    '--tag', 'asm_meta'
+    '--tag', 'vnet_asm'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -156,6 +156,35 @@ def train_init_epochs(model, init_epochs):
     return best_model, best_prec1, best_epoch
 
 
+def train_asm_meta_epochs(model, meta_epochs):
+    global best_prec1, best_epoch, best_model
+
+    for epoch in range(best_epoch + 1, meta_epochs):
+        lr = adjust_lr(args.lr, optimizer_a, epoch, writer)
+
+        # directly on unlabel data
+        asm_train_with_vnet(unlabel_loader, valid_loader,
+                            model, vnet,
+                            lr,
+                            optimizer_a, optimizer_c,
+                            args.delta, uc_select_fn, args.uncertain_samples_size,
+                            epoch, args.print_freq, writer)
+        best_model, best_prec1, best_epoch = valid_save_model(epoch, model, vnet)
+
+        # save vnet loss-weight map each epoch
+        with torch.no_grad():
+            x, y = get_vnet_curve(vnet, upper_loss=1)  # (100,)
+            x = x * 100  # 保证 global_step 横坐标最小为1
+            for i in range(len(x)):
+                writer.add_scalars('Meta/vnet', {
+                    f'v_epoch{epoch}': y[i]
+                }, global_step=x[i])
+
+    print(f'Finish meta train, best acc: {best_prec1}, best epoch: {best_epoch}')
+
+    return best_model, best_prec1, best_epoch
+
+
 if __name__ == '__main__':
     exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_{get_curtime()}'
     print('exp:', exp)
@@ -170,16 +199,23 @@ if __name__ == '__main__':
 
     # build model
     model = ResNet32(args.num_classes).cuda()
-    # vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
+    vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
     print('build model done!')
 
     # SGD
     optimizer_a = torch.optim.SGD(model.params(), args.lr,
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    # optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
-    #                               momentum=args.momentum, nesterov=args.nesterov,
-    #                               weight_decay=args.weight_decay)
+    optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
+                                  momentum=args.momentum, nesterov=args.nesterov,
+                                  weight_decay=args.weight_decay)
+    # Adam
+    # optimizer_a = torch.optim.Adam(model.params(),
+    #                                lr=1e-3,
+    #                                betas=(0.9, 0.999), eps=1e-8)
+
+    # AdaBound
+    # optimizer_a = AdaBound(model.params())
 
     criterion = nn.CrossEntropyLoss().cuda()
     uc_select_fn = get_select_fn(args.uncertain_criterion)
@@ -199,50 +235,12 @@ if __name__ == '__main__':
     # select meta data
     random.seed()
     sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
-    # valid_loader = DataLoader(meta_dataset,
-    #                           batch_size=args.batch_size,
-    #                           drop_last=False,
-    #                           shuffle=True, **kwargs)
-    meta_epochs = 50
+    meta_dataset = random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
+    valid_loader = DataLoader(meta_dataset,
+                              batch_size=args.batch_size,
+                              drop_last=False,
+                              shuffle=True, **kwargs)
 
-    # todo: 取多次 unlabel_loader 并集，但是 img_idx 找不到了
-    for epoch in range(best_epoch + 1, meta_epochs):
-        adjust_lr(args.lr, optimizer_a, epoch, writer)
+    train_asm_meta_epochs(model, meta_epochs=30)
 
-        begin_step = epoch * len(unlabel_loader)
-
-        for i, (input, target) in enumerate(unlabel_loader):
-            # fetch asm data from unlabel loader
-            asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio = \
-                asm_split_samples(model, input, target,
-                                  args.delta,
-                                  uc_select_fn, args.uncertain_samples_size)
-            writer.add_scalars('ASM/ratios', {
-                'hc_ratio': hc_ratio,
-                'uc_ratio': uc_ratio
-            }, global_step=begin_step + i)
-            writer.add_scalar('ASM/hc_acc', hc_acc, global_step=begin_step + i)
-
-            # select subset from labelset
-            meta_dataset = random_system_sample_meta_dataset(label_dataset,
-                                                             sort_cls_idxs_dict, args.num_meta)
-            asm_meta_dataset = CIFAR(
-                data=np.append(meta_dataset.data, asm_inputs, axis=0),
-                targets=np.append(meta_dataset.targets, asm_targets, axis=0),
-                transform=transform_train
-            )
-            asm_meta_loader = DataLoader(asm_meta_dataset,
-                                         batch_size=args.batch_size,
-                                         drop_last=False,
-                                         shuffle=True, **kwargs)
-
-            meta_losses, meta_accs = [], []
-            for _ in range(1):  # meta_train 在同一批次训练多次反而不好!
-                meta_loss, meta_acc = train_meta(asm_meta_loader, model, criterion,
-                                                 optimizer_a,
-                                                 step=f'{i}/{len(unlabel_loader)}', print_freq=1)
-                meta_losses.append(meta_loss)
-                meta_accs.append(meta_acc)
-
-            writer.add_scalar('ASM/train_loss', np.mean(meta_losses), global_step=begin_step + i)
-            writer.add_scalar('ASM/train_acc', np.mean(meta_accs), global_step=begin_step + i)
+    # todo: record shuffle unlabel idxs, and fine-tune

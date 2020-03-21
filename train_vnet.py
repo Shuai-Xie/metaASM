@@ -14,12 +14,12 @@ from pprint import pprint
 import random
 import numpy as np
 import copy
-from optim.adabound import AdaBound
 
 from datasets.cls_datasets import CIFAR
-from datasets.imb_data_utils import get_imb_meta_test_datasets
-
+from datasets.imb_data_utils import *
 from net import *
+from optim.adabound import AdaBound
+
 from engine import *
 from utils import *
 
@@ -53,6 +53,10 @@ parser.add_argument('--tag', default='exp', type=str,
 # asm
 parser.add_argument('--init_epochs', type=int, default=20, metavar='N',
                     help='number of epochs to train on init trainset')
+parser.add_argument('--meta_epochs', type=int, default=20, metavar='N',
+                    help='number of epochs to train on init trainset')
+parser.add_argument('--finetune_epochs', type=int, default=20, metavar='N',
+                    help='number of epochs to train on init trainset')
 parser.add_argument('--ckpt', type=str,
                     help='already pretrained model')
 parser.add_argument('--split', default=0.1, type=float,
@@ -75,15 +79,14 @@ params = [
     '--num_classes', '10',
     '--imb_factor', '1',
     # important params
-    '--num_meta', '50',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
+    '--num_meta', '10',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
     '-K', '50',  # 1/2 bs, batch uncertain samples, will rm hc in uc, so <= 50
-    '-uc', 'lc',
     '--split', '0.4',
     '--ratio', '1',  # 小样本
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
-    '--epochs', '50',
-    '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
-    '--tag', 'asm_meta'
+    '--meta_epochs', '10',
+    '--finetune_epochs', '10',  # lr decay
+    '--tag', 'snet'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -104,7 +107,7 @@ label_loader = DataLoader(label_dataset,
                           batch_size=args.batch_size,
                           drop_last=False,
                           shuffle=True, **kwargs)
-unlabel_loader = DataLoader(unlabel_dataset,  # DataLoader will cvt np to tensor
+unlabel_loader = DataLoader(unlabel_dataset,
                             batch_size=args.batch_size,
                             drop_last=False,
                             shuffle=True, **kwargs)  # shuffle 能带来更稳定的 imb
@@ -121,39 +124,23 @@ def empty_y():
     return np.empty([0], dtype='int64')
 
 
-def valid_save_model(epoch, model, vnet=None):
-    global best_prec1, best_epoch, best_model
+def valid_save_model(epoch, model, snet=None):
+    global best_prec1
 
+    # evaluate on testset
     _, prec1 = evaluate(test_loader, model, criterion,
                         epoch, args.print_freq, writer)
 
+    # remember best prec1 and save checkpoint
     if prec1 > best_prec1:
         best_prec1, best_epoch = prec1, epoch
-        best_model = model
         save_model(os.path.join(model_save_dir, 'rs32_epoch_{}.pth'.format(epoch)),
                    model, epoch, best_prec1)
-        if vnet:
-            save_model(os.path.join(model_save_dir, 'vnet_epoch_{}.pth'.format(epoch)),
-                       vnet, epoch, best_prec1)
+        if snet:
+            save_model(os.path.join(model_save_dir, 'snet_epoch_{}.pth'.format(epoch)),
+                       snet, epoch, best_prec1)
+
         print(f'epoch {epoch}, best acc: {best_prec1}, best epoch: {best_epoch}')
-
-    return best_model, best_prec1, best_epoch
-
-
-def train_init_epochs(model, init_epochs):
-    global best_prec1, best_epoch, best_model
-
-    for epoch in range(init_epochs):
-        # train
-        train_base(label_loader, model, criterion,
-                   optimizer_a,
-                   epoch, args.print_freq, writer)
-
-        best_model, best_prec1, best_epoch = valid_save_model(epoch, model)
-
-    print(f'Finish init train, best acc: {best_prec1}, best epoch: {best_epoch}')
-
-    return best_model, best_prec1, best_epoch
 
 
 if __name__ == '__main__':
@@ -164,85 +151,61 @@ if __name__ == '__main__':
     os.makedirs('exp', exist_ok=True)
     dump_json(vars(args), out_path=f'exp/{exp}.json')
 
-    writer = SummaryWriter(log_dir=os.path.join('runs', exp))
-    model_save_dir = os.path.join('output', exp)
-    os.makedirs(model_save_dir, exist_ok=True)
-
-    # build model
     model = ResNet32(args.num_classes).cuda()
-    # vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
+    snet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
+    # snet = SNet(args.num_classes, 100, 1).cuda()  # hard select
+
     print('build model done!')
 
     # SGD
     optimizer_a = torch.optim.SGD(model.params(), args.lr,
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    # optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
-    #                               momentum=args.momentum, nesterov=args.nesterov,
-    #                               weight_decay=args.weight_decay)
+    optimizer_c = torch.optim.SGD(snet.params(), 1e-5,  # lr 不变
+                                  momentum=args.momentum, nesterov=args.nesterov,
+                                  weight_decay=args.weight_decay)
+
+    # Adam
+    # optimizer_a = torch.optim.Adam(model.params(),
+    #                                lr=1e-3,
+    #                                betas=(0.9, 0.999), eps=1e-8)
+
+    # AdaBound
+    # optimizer_a = AdaBound(model.params())
 
     criterion = nn.CrossEntropyLoss().cuda()
-    uc_select_fn = get_select_fn(args.uncertain_criterion)
+    select_fn = get_select_fn(args.uncertain_criterion)
 
-    best_prec1, best_epoch, best_model = 0, 0, None
+    writer = SummaryWriter(log_dir=os.path.join('runs', exp))
+    model_save_dir = os.path.join('output', exp)
+    os.makedirs(model_save_dir, exist_ok=True)
+
+    best_prec1, best_epoch = 0, 0
 
     # train on initial labelset
-    if args.ckpt is not None:
-        print('load pretrain model')
-        model, optimizer_a, best_prec1, best_epoch = load_model(model, args.ckpt, optimizer_a)
-        writer.add_scalar('Test/top1_acc', best_prec1, global_step=best_epoch)
-    else:
-        print('train on initial labelset')
-        model, best_prec1, best_epoch = train_init_epochs(model, args.init_epochs)
-    # return best model
+    for epoch in range(10):
+        train_base(label_loader, model,
+                   criterion, optimizer_a,
+                   epoch, args.print_freq, writer)
+        valid_save_model(epoch, model)
 
     # select meta data
-    random.seed()
     sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
-    # valid_loader = DataLoader(meta_dataset,
-    #                           batch_size=args.batch_size,
-    #                           drop_last=False,
-    #                           shuffle=True, **kwargs)
-    meta_epochs = 50
+    meta_dataset = build_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
 
-    # todo: 取多次 unlabel_loader 并集，但是 img_idx 找不到了
-    for epoch in range(best_epoch + 1, meta_epochs):
-        adjust_lr(args.lr, optimizer_a, epoch, writer)
+    valid_loader = DataLoader(meta_dataset,
+                              batch_size=args.batch_size,
+                              drop_last=False,
+                              shuffle=True, **kwargs)
 
-        begin_step = epoch * len(unlabel_loader)
+    for epoch in range(10, 30):
+        train_with_snet(label_loader, valid_loader,
+                        model, snet,
+                        args.lr,
+                        optimizer_a, optimizer_c,
+                        epoch, args.print_freq, writer)
+        valid_save_model(epoch, model, snet)
 
-        for i, (input, target) in enumerate(unlabel_loader):
-            # fetch asm data from unlabel loader
-            asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio = \
-                asm_split_samples(model, input, target,
-                                  args.delta,
-                                  uc_select_fn, args.uncertain_samples_size)
-            writer.add_scalars('ASM/ratios', {
-                'hc_ratio': hc_ratio,
-                'uc_ratio': uc_ratio
-            }, global_step=begin_step + i)
-            writer.add_scalar('ASM/hc_acc', hc_acc, global_step=begin_step + i)
 
-            # select subset from labelset
-            meta_dataset = random_system_sample_meta_dataset(label_dataset,
-                                                             sort_cls_idxs_dict, args.num_meta)
-            asm_meta_dataset = CIFAR(
-                data=np.append(meta_dataset.data, asm_inputs, axis=0),
-                targets=np.append(meta_dataset.targets, asm_targets, axis=0),
-                transform=transform_train
-            )
-            asm_meta_loader = DataLoader(asm_meta_dataset,
-                                         batch_size=args.batch_size,
-                                         drop_last=False,
-                                         shuffle=True, **kwargs)
 
-            meta_losses, meta_accs = [], []
-            for _ in range(1):  # meta_train 在同一批次训练多次反而不好!
-                meta_loss, meta_acc = train_meta(asm_meta_loader, model, criterion,
-                                                 optimizer_a,
-                                                 step=f'{i}/{len(unlabel_loader)}', print_freq=1)
-                meta_losses.append(meta_loss)
-                meta_accs.append(meta_acc)
-
-            writer.add_scalar('ASM/train_loss', np.mean(meta_losses), global_step=begin_step + i)
-            writer.add_scalar('ASM/train_acc', np.mean(meta_accs), global_step=begin_step + i)
+    print(f'Finish initial train, best acc: {best_prec1}, best epoch: {best_epoch}')
