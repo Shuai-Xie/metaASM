@@ -73,6 +73,11 @@ test_loader = DataLoader(test_dataset,
                          batch_size=args.batch_size,
                          shuffle=False, **kwargs)
 
+"""
+baseline
+- directly train on total cifar10 dataset
+"""
+
 if __name__ == '__main__':
     exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_{get_curtime()}'
     print('exp:', exp)

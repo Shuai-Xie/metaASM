@@ -104,14 +104,22 @@ test_loader = DataLoader(test_dataset,
                          batch_size=args.batch_size,
                          shuffle=False, **kwargs)
 
-"""steps
-1. train init_epochs on labelset
-2. infer on unlabelset [use all]
-    2.1 select all hc samples by delta (entropy threshold)
-    2.2 select topK uc samples by uncertain_criterion, if mixed with hc, use hc
-3. update label_loader
-4. retrain
-5. goto 2
+"""
+original (total) ASM
+
+steps
+1. train init_epochs on D_L
+2. train asm_epochs on {D_L, D_U}
+    infer on D_U, get {D_hc, D_uc}
+    update {D_L, D_U} = {D_L + D_uc, D_U - D_uc}
+    form D_asm = {D_L, D_hc}
+    train on D_asm
+
+we test with different optimizer
+            acc         reduce cost
+sgd         92.65        8209/30000
+adam        90.22       14313/30000
+adabound    88.93       14277/30000
 """
 
 if __name__ == '__main__':

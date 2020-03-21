@@ -156,6 +156,25 @@ def train_init_epochs(model, init_epochs):
     return best_model, best_prec1, best_epoch
 
 
+"""
+batch asm with meta dataset
+
+steps
+1. train init_epochs on D_L
+2. infer on D_L, get P_L
+3. train meta_epochs on {D_M, D_U}
+    for B_U in D_U
+        infer on B_U, get {B_hc, B_uc}
+        get D_M by system-sampling on D_L
+        form B_asm = {D_M, B_hc, B_uc}
+        train n=1 iterations on B_asm
+    update D=P_L
+    collect {D_hc, D_uc}
+4. form D_finetune = {D_L, D_hc, D_uc}
+5. train finetune_epochs on D_finetune
+"""
+
+
 if __name__ == '__main__':
     exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_m{args.num_meta}_{get_curtime()}'
     print('exp:', exp)
