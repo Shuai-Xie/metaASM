@@ -1,6 +1,6 @@
 .DS_Store
 .idea
-
+exp/
 output/
 runs/
 z.py
