@@ -16,10 +16,11 @@ import numpy as np
 from datasets.cls_datasets import CIFAR
 from datasets.imb_data_utils import get_imb_meta_test_datasets, transform_train, transform_test
 from net.resnet import ResNet32
+from optim.adabound import AdaBound
 from utils import get_curtime, save_model
 
-from engine import adjust_learning_rate, train_base, validate
-from asm import detect_unlabel_imgs, get_select_fn, get_high_conf_samples
+from engine import adjust_lr, train_base, validate
+from utils import detect_unlabel_imgs, get_select_fn, get_high_conf_samples
 
 parser = argparse.ArgumentParser(description='Classification on cifar10')
 parser.add_argument('--dataset', default='cifar10', type=str,
@@ -74,11 +75,11 @@ params = [
     '--imb_factor', '1',
     # important params
     '--num_meta', '0',
-    '-K', '200',
-    '--init_epochs', '0',
-    '--split', '0.6',
-    '--ratio', '0.1',  # 小样本
-    '--tag', 'asm'
+    '-K', '2000',
+    '--init_epochs', '10',  # 试试更多 epoch
+    '--split', '0.4',
+    '--ratio', '1',  # 小样本
+    '--tag', 'asm_adam'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -93,6 +94,8 @@ label_dataset, unlabel_dataset, train_meta_dataset, test_dataset = get_imb_meta_
 
 # imb_train/valid_meta/test
 kwargs = {'num_workers': 4, 'pin_memory': True}
+
+# 将 label/unlabel loader 放入同一 batch
 label_loader = DataLoader(label_dataset,
                           batch_size=args.batch_size,
                           drop_last=False,
@@ -101,15 +104,36 @@ test_loader = DataLoader(test_dataset,
                          batch_size=args.batch_size,
                          shuffle=False, **kwargs)
 
+"""steps
+1. train init_epochs on labelset
+2. infer on unlabelset [use all]
+    2.1 select all hc samples by delta (entropy threshold)
+    2.2 select topK uc samples by uncertain_criterion, if mixed with hc, use hc
+3. update label_loader
+4. retrain
+5. goto 2
+"""
+
 if __name__ == '__main__':
     exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_{get_curtime()}'
     print('exp:', exp)
 
     model = ResNet32(args.num_classes).cuda()
-    optimizer_a = torch.optim.SGD(model.params(), args.lr,
-                                  momentum=args.momentum, nesterov=args.nesterov,
-                                  weight_decay=args.weight_decay)
     print('build model done!')
+
+    # SGD
+    # optimizer_a = torch.optim.SGD(model.params(), args.lr,
+    #                               momentum=args.momentum, nesterov=args.nesterov,
+    #                               weight_decay=args.weight_decay)
+
+    # Adam
+    # 60 epoch 后可能需要降低 lr, acc 不像 sgd 震荡较大
+    optimizer_a = torch.optim.Adam(model.params(),
+                                   lr=1e-3,
+                                   betas=(0.9, 0.999), eps=1e-8)
+
+    # AdaBound
+    # optimizer_a = AdaBound(model.params())
 
     criterion = nn.CrossEntropyLoss().cuda()
 
@@ -124,11 +148,13 @@ if __name__ == '__main__':
     # pre-define hc
     hc_data = np.empty([0] + list(label_dataset.data.shape[1:]), dtype='uint8')  # (0,32,32,3)
     hc_preds = np.empty([0], dtype='int64')
+    hc_idxs, uc_idxs = [], []
+    total_uc_num = 0  # asm 总共使用的 uc 样本数
 
     use_asm = True
     for epoch in range(1, args.epochs + 1):
         # 调整 classifier optimizer 的 lr = meta_lr
-        adjust_learning_rate(args.lr, optimizer_a, epoch)
+        adjust_lr(args.lr, optimizer_a, epoch, writer)
 
         # train on (imb_train_data)
         writer.add_scalar('ASM/batches', len(label_loader), global_step=epoch)
@@ -155,39 +181,42 @@ if __name__ == '__main__':
             y_pred_prob = detect_unlabel_imgs(model, unlabel_dataset.data,  # on total unlabel pool
                                               args.num_classes, args.batch_size)
             # 2.split label/unlabel dataset
-            # 先选 hc，再选 top K，如果 K 先，就定量了
+            # 以 hc 为主，舍弃 uc 中相同的，如果先选 uc， K 就定量了
 
-            # 2.1 add 'ann' uc_idxs to label_dataset
-            # Active Learning [human label]
-            _, uc_idxs = select_fn(y_pred_prob, args.uncertain_samples_size)  # top 1000, np array 不会越界
-            # update label_dataset [note: rm in unlabel should after hc, hc need ori unlabel idxs]
-            label_dataset.data = np.append(label_dataset.data,  # append by data
-                                           np.take(unlabel_dataset.data, uc_idxs, axis=0), axis=0)
-            label_dataset.targets = np.append(label_dataset.targets,
-                                              np.take(unlabel_dataset.targets, uc_idxs, axis=0), axis=0)
-
-            # 2.2 add hc samples to label_loader, not add to label_dataset(only labeled)
+            # 2.1 add hc samples to label_loader, not add to label_dataset(only labeled)
             # Self Learning [machine label]
             if args.cost_effective:
                 hc_idxs, hc_preds = get_high_conf_samples(y_pred_prob, args.delta)  # entropy thre, note num_classes
-                # hc 占据 unlabel data 很大比例，说明 unlabelset 此时信息量已经很少了，不在其 infer
-                if len(hc_idxs) / len(unlabel_dataset) > 0.9:
-                    use_asm = False
-                    print('epoch:', epoch, 'not use asm')
+                hc_ratio = len(hc_idxs) / len(unlabel_dataset)
+                writer.add_scalar('ASM/hc_ratio', hc_ratio, global_step=epoch)
+
+                if hc_ratio > 0.9:  # hc 占比 unlabel 很高时，unlabel 可用信息正在减少
+                    use_asm = False  # note! not use asm here!
                     # 加上这批 hc, label_loader 不再更新
 
-                # rm samples already selected by uc
-                hc = np.array([[i, l] for i, l in zip(hc_idxs, hc_preds) if i not in uc_idxs])
-
-                if len(hc) > 0:  # 存在 hc 样本
-                    hc_data, hc_preds = np.take(unlabel_dataset.data, hc[:, 0], axis=0), hc[:, 1]
-                    hc_gts = np.take(unlabel_dataset.targets, hc[:, 0], axis=0)
+                if len(hc_idxs) > 0:  # 存在 hc 样本
+                    hc_data = np.take(unlabel_dataset.data, hc_idxs, axis=0)
+                    # note: hc_acc 实际上不可获得
+                    hc_gts = np.take(unlabel_dataset.targets, hc_idxs, axis=0)
                     hc_acc = sum(hc_preds == hc_gts) / len(hc_gts)
                     writer.add_scalar('ASM/hc_acc', hc_acc, global_step=epoch)
 
-            # update unlabel_dataset after hc, hc need ori unlabel idxs
-            unlabel_dataset.data = np.delete(unlabel_dataset.data, uc_idxs, axis=0)  # rm by idxs
-            unlabel_dataset.targets = np.delete(unlabel_dataset.targets, uc_idxs, axis=0)
+            # 2.2 add 'ann' uc_idxs to label_dataset
+            # Active Learning [human label]
+            if use_asm:
+                _, uc_idxs = select_fn(y_pred_prob, args.uncertain_samples_size)  # top 1000, np array 不会越界
+
+                # rm samples already selected by hc
+                uc_idxs = [i for i in uc_idxs if i not in hc_idxs]
+                total_uc_num += len(uc_idxs)
+
+                # add/rm uc samples to label/unlabel dataset
+                label_dataset.data = np.append(label_dataset.data,  # append by data
+                                               np.take(unlabel_dataset.data, uc_idxs, axis=0), axis=0)
+                label_dataset.targets = np.append(label_dataset.targets,
+                                                  np.take(unlabel_dataset.targets, uc_idxs, axis=0), axis=0)
+                unlabel_dataset.data = np.delete(unlabel_dataset.data, uc_idxs, axis=0)  # rm by idxs
+                unlabel_dataset.targets = np.delete(unlabel_dataset.targets, uc_idxs, axis=0)
 
             # 3.update label_loader for next epoch train
             # 不能直接更新原来 label_loader.dataset
@@ -201,21 +230,15 @@ if __name__ == '__main__':
                                       batch_size=args.batch_size,
                                       drop_last=False,
                                       shuffle=True, **kwargs)
-
         # record samples num
         writer.add_scalars('ASM/samples', {
             # train = hc + label
             # total = label + unlabel
             'train': len(label_loader.dataset),
-            'hc': len(hc_data),
+            'hc': len(hc_idxs),
+            'uc': total_uc_num,
             'label': len(label_dataset),
             'unlabel': len(unlabel_dataset)
         }, global_step=epoch)
-
-        # print('samples')
-        # print('train:', len(label_loader.dataset))
-        # print('hc:', len(hc_data))
-        # print('label:', len(label_dataset))
-        # print('unlabel:', len(unlabel_dataset))
 
     print('Best accuracy: {}, epoch: {}'.format(best_prec1, best_epoch))

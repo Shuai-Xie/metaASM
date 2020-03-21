@@ -14,12 +14,12 @@ from pprint import pprint
 import random
 import numpy as np
 import copy
-
-from datasets.cls_datasets import CIFAR
-from datasets.imb_data_utils import *
-from net import *
 from optim.adabound import AdaBound
 
+from datasets.cls_datasets import CIFAR
+from datasets.imb_data_utils import get_imb_meta_test_datasets
+
+from net import *
 from engine import *
 from utils import *
 
@@ -84,9 +84,9 @@ params = [
     '--split', '0.4',
     '--ratio', '1',  # 小样本
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
-    '--meta_epochs', '10',
-    '--finetune_epochs', '10',  # lr decay
-    '--tag', 'snet'
+    '--epochs', '50',
+    '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
+    '--tag', 'vnet'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -124,23 +124,37 @@ def empty_y():
     return np.empty([0], dtype='int64')
 
 
-def valid_save_model(epoch, model, snet=None):
-    global best_prec1
+def valid_save_model(epoch, model, vnet=None):
+    global best_prec1, best_epoch, best_model
 
-    # evaluate on testset
     _, prec1 = evaluate(test_loader, model, criterion,
                         epoch, args.print_freq, writer)
 
-    # remember best prec1 and save checkpoint
     if prec1 > best_prec1:
         best_prec1, best_epoch = prec1, epoch
+        best_model = model
         save_model(os.path.join(model_save_dir, 'rs32_epoch_{}.pth'.format(epoch)),
                    model, epoch, best_prec1)
-        if snet:
-            save_model(os.path.join(model_save_dir, 'snet_epoch_{}.pth'.format(epoch)),
-                       snet, epoch, best_prec1)
+        if vnet:
+            save_model(os.path.join(model_save_dir, 'vnet_epoch_{}.pth'.format(epoch)),
+                       vnet, epoch, best_prec1)
 
         print(f'epoch {epoch}, best acc: {best_prec1}, best epoch: {best_epoch}')
+
+    return best_model, best_prec1, best_epoch
+
+
+def train_init_epochs(model, epochs):
+    global best_prec1, best_epoch, best_model
+    for epoch in range(epochs):
+        # train
+        train_base(label_loader, model, criterion,
+                   optimizer_a,
+                   epoch, args.print_freq, writer)
+
+        best_model, best_prec1, best_epoch = valid_save_model(epoch, model)
+
+    return best_model, best_prec1, best_epoch
 
 
 if __name__ == '__main__':
@@ -152,8 +166,7 @@ if __name__ == '__main__':
     dump_json(vars(args), out_path=f'exp/{exp}.json')
 
     model = ResNet32(args.num_classes).cuda()
-    snet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
-    # snet = SNet(args.num_classes, 100, 1).cuda()  # hard select
+    vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
 
     print('build model done!')
 
@@ -161,7 +174,7 @@ if __name__ == '__main__':
     optimizer_a = torch.optim.SGD(model.params(), args.lr,
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    optimizer_c = torch.optim.SGD(snet.params(), 1e-5,  # lr 不变
+    optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
 
@@ -180,32 +193,43 @@ if __name__ == '__main__':
     model_save_dir = os.path.join('output', exp)
     os.makedirs(model_save_dir, exist_ok=True)
 
-    best_prec1, best_epoch = 0, 0
+    best_prec1, best_epoch, best_model = 0, 0, None
 
     # train on initial labelset
-    for epoch in range(10):
-        train_base(label_loader, model,
-                   criterion, optimizer_a,
-                   epoch, args.print_freq, writer)
-        valid_save_model(epoch, model)
+    if args.ckpt is not None:
+        print('load pretrain model')
+        model, optimizer_a, best_prec1, best_epoch = load_model(model, args.ckpt, optimizer_a)
+        writer.add_scalar('Test/top1_acc', best_prec1, global_step=best_epoch)
+    else:
+        print('train on initial labelset')
+        model, best_prec1, best_epoch = train_init_epochs(model, args.init_epochs)
 
     # select meta data
     sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
-    meta_dataset = build_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
+    meta_dataset = sample_best_train_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
 
     valid_loader = DataLoader(meta_dataset,
                               batch_size=args.batch_size,
                               drop_last=False,
                               shuffle=True, **kwargs)
 
-    for epoch in range(10, 30):
-        train_with_snet(label_loader, valid_loader,
-                        model, snet,
+    for epoch in range(best_epoch + 1, args.epochs):
+        adjust_lr(args.lr, optimizer_a, epoch, writer)
+
+        train_with_vnet(label_loader, valid_loader,
+                        model, vnet,
                         args.lr,
                         optimizer_a, optimizer_c,
                         epoch, args.print_freq, writer)
-        valid_save_model(epoch, model, snet)
+        valid_save_model(epoch, model, vnet)
 
-
+        # save vnet loss-weight map each epoch
+        with torch.no_grad():
+            x, y = get_vnet_curve(vnet)  # (100,)
+            x = x * 10  # 保证 global_step 横坐标最小为1
+            for i in range(len(x)):
+                writer.add_scalars('Train/vnet', {
+                    f'v_epoch{epoch}': y[i]
+                }, global_step=x[i])
 
     print(f'Finish initial train, best acc: {best_prec1}, best epoch: {best_epoch}')

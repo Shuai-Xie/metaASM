@@ -15,7 +15,7 @@ from datasets.imb_data_utils import get_imb_meta_test_datasets
 from net.resnet import ResNet32
 from pprint import pprint
 from utils import get_curtime, save_model
-from engine import adjust_learning_rate, train_base, validate
+from engine import *
 
 parser = argparse.ArgumentParser(description='Classification on cifar10')
 parser.add_argument('--dataset', default='cifar10', type=str,
@@ -93,7 +93,7 @@ if __name__ == '__main__':
 
     for epoch in range(1, args.epochs + 1):
         # 调整 classifier optimizer 的 lr = meta_lr
-        adjust_learning_rate(args.lr, optimizer_a, epoch)
+        adjust_lr(args.lr, optimizer_a, epoch, writer)
 
         # train on (imb_train_data)
         train_base(train_loader, model, criterion,
@@ -101,8 +101,8 @@ if __name__ == '__main__':
                    epoch, args.print_freq, writer)
 
         # evaluate on validation set
-        prec1 = validate(test_loader, model, criterion,
-                         epoch, args.print_freq, writer)
+        _, prec1 = evaluate(test_loader, model, criterion,
+                            epoch, args.print_freq, writer)
 
         # remember best prec@1 and save checkpoint
         if prec1 > best_prec1:

@@ -75,15 +75,15 @@ params = [
     '--num_classes', '10',
     '--imb_factor', '1',
     # important params
-    '--num_meta', '50',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
+    '--num_meta', '20',  # 从 labelset 选出的代表性 sample 数量，恰好 = bs?
     '-K', '50',  # 1/2 bs, batch uncertain samples, will rm hc in uc, so <= 50
     '-uc', 'lc',
     '--split', '0.4',
     '--ratio', '1',  # 小样本
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
     '--epochs', '50',
-    '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
-    '--tag', 'asm_meta'
+    '--ckpt', 'output/asm_meta_cifar10_imb1_s0.4_r1.0_Mar19_202659/rs32_epoch_19.pth',
+    '--tag', 'asm_meta_adam'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -157,7 +157,7 @@ def train_init_epochs(model, init_epochs):
 
 
 if __name__ == '__main__':
-    exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_{get_curtime()}'
+    exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_m{args.num_meta}_{get_curtime()}'
     print('exp:', exp)
 
     # exp_dir
@@ -174,12 +174,14 @@ if __name__ == '__main__':
     print('build model done!')
 
     # SGD
-    optimizer_a = torch.optim.SGD(model.params(), args.lr,
-                                  momentum=args.momentum, nesterov=args.nesterov,
-                                  weight_decay=args.weight_decay)
-    # optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
+    # optimizer_a = torch.optim.SGD(model.params(), args.lr,
     #                               momentum=args.momentum, nesterov=args.nesterov,
     #                               weight_decay=args.weight_decay)
+
+    # Adam
+    optimizer_a = torch.optim.Adam(model.params(),
+                                   lr=1e-3,
+                                   betas=(0.9, 0.999), eps=1e-8)
 
     criterion = nn.CrossEntropyLoss().cuda()
     uc_select_fn = get_select_fn(args.uncertain_criterion)
@@ -198,7 +200,6 @@ if __name__ == '__main__':
 
     # select meta data
     random.seed()
-    sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
     # valid_loader = DataLoader(meta_dataset,
     #                           batch_size=args.batch_size,
     #                           drop_last=False,
@@ -206,11 +207,14 @@ if __name__ == '__main__':
     meta_epochs = 50
 
     # todo: 取多次 unlabel_loader 并集，但是 img_idx 找不到了
+    # epoch 29 reduce lr
     for epoch in range(best_epoch + 1, meta_epochs):
-        adjust_lr(args.lr, optimizer_a, epoch, writer)
+        # adjust_lr(args.lr, optimizer_a, epoch, writer)
+
+        # update sample probs
+        sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
 
         begin_step = epoch * len(unlabel_loader)
-
         for i, (input, target) in enumerate(unlabel_loader):
             # fetch asm data from unlabel loader
             asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio = \
@@ -232,7 +236,7 @@ if __name__ == '__main__':
                 transform=transform_train
             )
             asm_meta_loader = DataLoader(asm_meta_dataset,
-                                         batch_size=args.batch_size,
+                                         batch_size=args.batch_size,  # 保持和原模型相同 batchsize
                                          drop_last=False,
                                          shuffle=True, **kwargs)
 
@@ -246,3 +250,24 @@ if __name__ == '__main__':
 
             writer.add_scalar('ASM/train_loss', np.mean(meta_losses), global_step=begin_step + i)
             writer.add_scalar('ASM/train_acc', np.mean(meta_accs), global_step=begin_step + i)
+
+            # eval
+            # if i > 0 and i % 10 == 0:
+            #     loss, prec1 = evaluate(test_loader, model, criterion,
+            #                            epoch, args.print_freq, writer=None)
+            #     writer.add_scalars('Meta/test_loss', {
+            #         f'epoch{epoch}': loss
+            #     }, global_step=i)
+            #     writer.add_scalars('Meta/test_acc', {
+            #         f'epoch{epoch}': prec1
+            #     }, global_step=i)
+            #
+            #     if prec1 > best_prec1:
+            #         best_prec1, best_epoch = prec1, epoch
+            #         best_model = copy.deepcopy(model)  # 保留最优模型
+            #         save_model(os.path.join(model_save_dir, 'rs32_epoch_{}.pth'.format(best_epoch)),
+            #                    best_model, best_epoch, best_prec1)
+
+        valid_save_model(epoch, model)
+
+    print(f'Finish train, best acc: {best_prec1}, best epoch: {best_epoch}')

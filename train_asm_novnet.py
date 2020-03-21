@@ -83,7 +83,7 @@ params = [
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
     '--epochs', '50',
     '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
-    '--tag', 'vnet_asm'
+    '--tag', 'asm_novnet'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -156,31 +156,21 @@ def train_init_epochs(model, init_epochs):
     return best_model, best_prec1, best_epoch
 
 
-def train_asm_meta_epochs(model, meta_epochs):
+def train_asm_epochs(model, meta_epochs):
     global best_prec1, best_epoch, best_model
 
     for epoch in range(best_epoch + 1, meta_epochs):
-        lr = adjust_lr(args.lr, optimizer_a, epoch, writer)
+        adjust_lr(args.lr, optimizer_a, epoch, writer)
 
         # directly on unlabel data
-        asm_train_with_vnet(unlabel_loader, valid_loader,
-                            model, vnet,
-                            lr,
-                            optimizer_a, optimizer_c,
-                            args.delta, uc_select_fn, args.uncertain_samples_size,
-                            epoch, args.print_freq, writer)
-        best_model, best_prec1, best_epoch = valid_save_model(epoch, model, vnet)
+        asm_train(unlabel_loader, model,
+                  criterion, optimizer_a,
+                  args.delta, uc_select_fn, args.uncertain_samples_size,
+                  epoch, args.print_freq, writer)
 
-        # save vnet loss-weight map each epoch
-        with torch.no_grad():
-            x, y = get_vnet_curve(vnet, upper_loss=1)  # (100,)
-            x = x * 100  # 保证 global_step 横坐标最小为1
-            for i in range(len(x)):
-                writer.add_scalars('Meta/vnet', {
-                    f'v_epoch{epoch}': y[i]
-                }, global_step=x[i])
+        best_model, best_prec1, best_epoch = valid_save_model(epoch, model)
 
-    print(f'Finish meta train, best acc: {best_prec1}, best epoch: {best_epoch}')
+    print(f'Finish asm train, best acc: {best_prec1}, best epoch: {best_epoch}')
 
     return best_model, best_prec1, best_epoch
 
@@ -199,23 +189,16 @@ if __name__ == '__main__':
 
     # build model
     model = ResNet32(args.num_classes).cuda()
-    vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
+    # vnet = VNet(1, 100, 1).cuda()  # weights 还输入 loss
     print('build model done!')
 
     # SGD
     optimizer_a = torch.optim.SGD(model.params(), args.lr,
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
-                                  momentum=args.momentum, nesterov=args.nesterov,
-                                  weight_decay=args.weight_decay)
-    # Adam
-    # optimizer_a = torch.optim.Adam(model.params(),
-    #                                lr=1e-3,
-    #                                betas=(0.9, 0.999), eps=1e-8)
-
-    # AdaBound
-    # optimizer_a = AdaBound(model.params())
+    # optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
+    #                               momentum=args.momentum, nesterov=args.nesterov,
+    #                               weight_decay=args.weight_decay)
 
     criterion = nn.CrossEntropyLoss().cuda()
     uc_select_fn = get_select_fn(args.uncertain_criterion)
@@ -233,14 +216,14 @@ if __name__ == '__main__':
     # return best model
 
     # select meta data
-    random.seed()
-    sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
-    meta_dataset = random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
-    valid_loader = DataLoader(meta_dataset,
-                              batch_size=args.batch_size,
-                              drop_last=False,
-                              shuffle=True, **kwargs)
+    # random.seed()
+    # sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
+    # meta_dataset = random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
+    # valid_loader = DataLoader(meta_dataset,
+    #                           batch_size=args.batch_size,
+    #                           drop_last=False,
+    #                           shuffle=True, **kwargs)
 
-    train_asm_meta_epochs(model, meta_epochs=30)
+    train_asm_epochs(model, meta_epochs=50)
 
     # todo: record shuffle unlabel idxs, and fine-tune

@@ -180,7 +180,7 @@ def train_asm_meta_epochs(model, meta_epochs):
                     f'v_epoch{epoch}': y[i]
                 }, global_step=x[i])
 
-    print(f'Finish meta train, best acc: {best_prec1}, best epoch: {best_epoch}')
+    print(f'Finish asm meta train, best acc: {best_prec1}, best epoch: {best_epoch}')
 
     return best_model, best_prec1, best_epoch
 
@@ -241,6 +241,5 @@ if __name__ == '__main__':
                               drop_last=False,
                               shuffle=True, **kwargs)
 
-    train_asm_meta_epochs(model, meta_epochs=30)
+    train_asm_meta_epochs(model, meta_epochs=50)
 
-    # todo: record shuffle unlabel idxs, and fine-tune
