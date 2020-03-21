@@ -2,9 +2,10 @@ import torch
 import torch.nn.functional as F
 from datasets.cls_datasets import CIFAR
 from torch.utils.data import DataLoader
-from datasets.imb_data_utils import transform_test
-from utils import to_numpy, to_var
+from datasets.imb_data_utils import transform_test, transform_train
+from utils.base_utils import to_numpy, to_var
 import numpy as np
+from PIL import Image
 
 
 class Delta_Scheduler:
@@ -16,13 +17,23 @@ class Delta_Scheduler:
         self.delta -= self.step_decay
 
 
+"""
+for many unlabel imgs
+"""
+
+
 @torch.no_grad()
-def detect_unlabel_imgs(model, batch_unlabel_imgs, num_classes, bs=1):
+def detect_unlabel_imgs(model, unlabel_imgs, num_classes, bs=100):
     model.eval()
-    # pass fake targets to build dataloader
-    dataset = CIFAR(batch_unlabel_imgs, [-1] * len(batch_unlabel_imgs), transform=transform_test)
-    dataloader = DataLoader(dataset, batch_size=bs,
-                            shuffle=False, num_workers=4, drop_last=False)
+    # build dataloader for batch infer
+    dataset = CIFAR(data=unlabel_imgs,
+                    targets=[-1] * len(unlabel_imgs),  # fake targets
+                    transform=transform_test)
+    dataloader = DataLoader(dataset,
+                            batch_size=bs,
+                            shuffle=False,  # 按顺序获取 probs
+                            num_workers=4,
+                            drop_last=False)
 
     y_pred_prob = np.empty((0, num_classes))
 
@@ -36,7 +47,75 @@ def detect_unlabel_imgs(model, batch_unlabel_imgs, num_classes, bs=1):
     return y_pred_prob
 
 
-# 4 ways to select informative samples by prob vector
+"""
+for batch unlabel imgs
+"""
+
+
+def cvt_input_var(input, train=True):
+    B, H, W, C = input.shape
+    input_var = torch.empty([B, C, H, W])
+
+    if train:
+        for i in range(B):
+            input_var[i] = transform_train(input[i])
+    else:
+        for i in range(B):
+            input_var[i] = transform_test(input[i])
+
+    return to_var(input_var, requires_grad=False)  # cuda
+
+
+@torch.no_grad()
+def asm_split_samples(model, input, target,
+                      hc_delta,
+                      uc_select_fn, K):
+    """
+    input: torch.Size([100, 32, 32, 3]), torch.uint8, HWC
+    target: torch.Size([100]), torch.int64
+    """
+    # np
+    input = input.numpy().astype('uint8')  # np img
+    target = target.numpy().astype('int64')
+
+    # tensor
+    input_var = cvt_input_var(input, train=False)  # transfrom test
+
+    # infer on batch input unlabel data
+    outputs = model(input_var)
+    probs = F.softmax(outputs, dim=-1)
+    probs = to_numpy(probs)  # =0?
+
+    # hc
+    hc_idxs, hc_preds = get_hc_samples(probs, hc_delta)
+    hc_ratio = len(hc_idxs) / len(probs)
+
+    if len(hc_idxs) > 0:
+        hc_gts = np.take(target, hc_idxs, axis=0)  # divide 0
+        hc_acc = sum(hc_preds == hc_gts) / len(hc_gts)
+    else:
+        hc_acc = 0
+
+    # todo: 考虑是否要选入除 hc 后剩余数据；选 uc 为了加快训练
+    _, uc_idxs = uc_select_fn(probs, K)
+    uc_idxs = [k for k in uc_idxs if k not in hc_idxs]  # list, rm uc in hc
+    uc_ratio = len(uc_idxs) / len(probs)
+    # 只要 hc_ratio > 1 - K / len(probs) [ori uc_ratio], 二者之和 = 1
+
+    asm_inputs = np.take(input, uc_idxs + list(hc_idxs), axis=0)
+    asm_targets = np.append(target[uc_idxs], hc_preds, axis=0)  # 注意 hc use preds!
+
+    # shuffle uc/hc together
+    idxs = np.random.permutation(len(asm_inputs))
+    asm_inputs, asm_targets = asm_inputs[idxs], asm_targets[idxs]  # np img, targets
+
+    return asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio
+
+
+"""
+4 ways to select informative samples by prob vector
+"""
+
 
 # Random sampling
 def random_sampling(y_pred_prob, n_samples):
@@ -53,7 +132,7 @@ def least_confidence(y_pred_prob, n_samples):
         lci_idx: [ori_idx]  # (N,) ori_idx sort by confidence
     """
     origin_index = np.arange(0, len(y_pred_prob))
-    max_prob = np.max(y_pred_prob, axis=1)
+    max_prob = np.max(y_pred_prob, axis=1)  # lc is max_prob
     pred_label = np.argmax(y_pred_prob, axis=1)
 
     lci = np.column_stack((origin_index, max_prob, pred_label))
@@ -99,7 +178,7 @@ def get_select_fn(criterion):
 
 
 # Rank high confidence samples by entropy
-def get_high_conf_samples(y_pred_prob, delta):
+def get_hc_samples(y_pred_prob, delta):
     eni, eni_idx = entropy(y_pred_prob, len(y_pred_prob))
     eni = eni[eni[:, 1] > 0]  # valid
     hcs = eni[eni[:, 1] < delta]  # en < delte
