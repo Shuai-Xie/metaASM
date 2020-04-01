@@ -83,7 +83,7 @@ params = [
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
     '--epochs', '50',
     '--ckpt', 'output/asm_meta_cifar10_imb1_s0.4_r1.0_Mar19_202659/rs32_epoch_19.pth',
-    '--tag', 'asm_uc'
+    '--tag', 'asm'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -164,6 +164,13 @@ steps
     collect {D_hc, D_uc}
 4. form D_finetune = {D_L, D_hc, D_uc}
 5. train finetune_epochs on D_finetune
+
+注意：
+
+1. meta_epochs 中 unlabel_loader 每轮采用不同 shuffle 方式
+    记录 global_uc_samples 后，发现 SGD 比 Adam 要使用更多 uc_sample，因为前期收敛慢
+
+2. num_meta 数量会使得训练时长翻倍，因为直接影响 asm_meta_loader 训练的 batch 数
 """
 
 # exp
@@ -228,6 +235,7 @@ if __name__ == '__main__':
         adjust_lr(args.lr, optimizer_a, epoch, writer)
 
         # update sample probs
+        # 每次都要在 label_dataset 重新推理计算 uncertain 排名
         sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
 
         begin_step = epoch * len(unlabel_loader)
@@ -237,33 +245,39 @@ if __name__ == '__main__':
         # img_idxs get the identical_img_idx of each unlabel sample
         for i, (input, target, img_idxs) in enumerate(unlabel_loader):
             # fetch asm data from unlabel loader
-            asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio, uc_idxs = \
-                asm_split_batch_unlabel_samples(model, input, target,
-                                                args.delta,
-                                                uc_select_fn, args.uncertain_samples_size)
+            results = asm_split_hc_delta_uc_K(model, input, target,
+                                              args.delta,
+                                              uc_select_fn, args.uncertain_samples_size)
+
             # gloal uc_idxs <- local uc_idxs
             # 虽然 uc_ratio 从全局来看 < 50%，但尚不确定是否在不同 epoch 有不同的 uc_sample 选出
-            batch_uc_idxs = cvt_iter_to_list(img_idxs[uc_idxs], int)
+            batch_uc_idxs = cvt_iter_to_list(img_idxs[results['uc']['idxs']], int)
             total_uc_idxs.extend(batch_uc_idxs)
 
-            writer.add_scalars('ASM/ratios', {
-                'hc_ratio': hc_ratio,
-                'uc_ratio': uc_ratio
+            writer.add_scalars(f'ASM/ratios', {
+                'hc_ratio': results['hc']['ratio'],
+                'uc_ratio': results['uc']['ratio']
             }, global_step=begin_step + i)
-            writer.add_scalar('ASM/hc_acc', hc_acc, global_step=begin_step + i)
 
-            # select subset from labelset
-            # todo: batch 样本的随机性体现在这里，可以引入更复杂的 hard meta_dataset
+            writer.add_scalars(f'ASM/accs', {
+                'hc_acc': results['hc']['acc'],
+                'uc_acc': results['uc']['acc']
+            }, global_step=begin_step + i)
+
+            # select subset from labelset, 系统抽样 all-hard levels
             meta_dataset = random_system_sample_meta_dataset(label_dataset,
                                                              sort_cls_idxs_dict, args.num_meta)
+
+            asm_data = np.append(results['hc']['data'], results['uc']['data'], axis=0)
+            asm_targets = np.append(results['hc']['targets'], results['uc']['targets'], axis=0)
+
             asm_meta_dataset = CIFAR(
-                data=np.append(meta_dataset.data, asm_inputs, axis=0),
+                data=np.append(meta_dataset.data, asm_data, axis=0),
                 targets=np.append(meta_dataset.targets, asm_targets, axis=0),
                 transform=transform_train
             )
             asm_meta_loader = DataLoader(asm_meta_dataset,
                                          batch_size=args.batch_size,  # 保持和原模型相同 batchsize
-                                         # batch_size=len(asm_meta_dataset),  # 全部放到1个batch，bs一直在变，acc 掉的快
                                          drop_last=False,
                                          shuffle=True, **kwargs)
 

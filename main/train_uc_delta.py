@@ -186,9 +186,9 @@ def train_asm_epochs(model, meta_epochs, inner_meta_epochs=1, prefix='ASM'):
         for i, (input, target, img_idxs) in enumerate(unlabel_loader):
             # fetch asm data from unlabel loader
             # batch 没有改变，但是选出的样本不一样了!!
-            results = asm_split_batch_unlabel_samples_v2(model, input, target,
-                                                         args.hc_delta,
-                                                         args.uc_delta)
+            results = asm_split_hc_uc_delta(model, input, target,
+                                            args.hc_delta,
+                                            args.uc_delta)
             # gloal uc_idxs <- local uc_idxs
             # 虽然 uc_ratio 从全局来看 < 50%，但尚不确定是否在不同 epoch 有不同的 uc_sample 选出
             batch_uc_idxs = cvt_iter_to_list(img_idxs[results['uc']['idxs']], type=int)

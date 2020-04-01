@@ -89,7 +89,7 @@ params = [
     '--split', '0.4',
     '--ratio', '1',  # 小样本
     '--init_epochs', '30',  # meta_epochs, finetune_epochs?
-    '--ckpt', 'output/meta_cifar10_imb1_s0.4_r1.0_m10_Mar23_125320/rs32_epoch_29.pth',
+    '--ckpt', 'output/hope_cifar10_imb1_s0.4_r1.0_m50_Mar23_201207/rs32_epoch_29.pth',
     '--tag', 'meta'
 ]
 args = parser.parse_args(params)
@@ -185,73 +185,47 @@ def train_asm_epochs(model, meta_epochs, inner_meta_epochs=None, prefix='ASM'):
         for i, (input, target, img_idxs) in enumerate(unlabel_loader):
             # fetch asm data from unlabel loader
             # batch 没有改变，但是选出的样本不一样了!!
-            asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio, uc_idxs = \
-                asm_split_batch_unlabel_samples(model, input, target,
-                                                args.delta,
-                                                uc_select_fn, args.uncertain_samples_size,
-                                                use_hc=False)
+            results = asm_split_hc_delta_uc_K(model, input, target,
+                                              args.delta,
+                                              uc_select_fn, args.uncertain_samples_size)
 
             # gloal uc_idxs <- local uc_idxs
             # 虽然 uc_ratio 从全局来看 < 50%，但尚不确定是否在不同 epoch 有不同的 uc_sample 选出
-            batch_uc_idxs = cvt_iter_to_list(img_idxs[uc_idxs], type=int)
+            batch_uc_idxs = cvt_iter_to_list(img_idxs[results['uc']['idxs']], type=int)
             total_uc_idxs.extend(batch_uc_idxs)
 
-            # store batch0 chosen uc_idxs of each meta epoch
-            if i == 0:
-                batch0_uc_idxs['ori'] = list(sorted(cvt_iter_to_list(img_idxs, type=int)))
-                batch0_uc_idxs[epoch] = list(sorted(batch_uc_idxs))
-
-            # Early stop asm signal, avg hc_ratio
-            total_hc_ratios.append(hc_ratio)
-
             writer.add_scalars(f'{prefix}/ratios', {
-                'hc_ratio': hc_ratio,
-                'uc_ratio': uc_ratio
+                'hc_ratio': results['hc']['ratio'],
+                'uc_ratio': results['uc']['ratio']
             }, global_step=begin_step + i)
-            writer.add_scalar(f'{prefix}/hc_acc', hc_acc, global_step=begin_step + i)
 
-            # meta_dataset = random_system_sample_meta_dataset(label_dataset,
-            #                                                  sort_cls_idxs_dict, args.num_meta)
+            writer.add_scalars(f'{prefix}/accs', {
+                'hc_acc': results['hc']['acc'],
+                'uc_acc': results['uc']['acc']
+            }, global_step=begin_step + i)
 
-            # todo: 交替使用 hard/random samples from labelset
-            # todo: 加权 loss
             if i % 2 == 0:
                 meta_dataset = random_system_sample_meta_dataset(label_dataset,
                                                                  sort_cls_idxs_dict, args.num_meta)
             else:
                 meta_dataset = top_hard_meta_dataset
 
+            asm_data = np.append(results['hc']['data'], results['uc']['data'], axis=0)
+            asm_targets = np.append(results['hc']['targets'], results['uc']['targets'], axis=0)
+
             asm_meta_dataset = CIFAR(
-                data=np.append(meta_dataset.data, asm_inputs, axis=0),
+                data=np.append(meta_dataset.data, asm_data, axis=0),
                 targets=np.append(meta_dataset.targets, asm_targets, axis=0),
                 transform=transform_train
             )
             asm_meta_loader = DataLoader(asm_meta_dataset,
                                          batch_size=args.batch_size,  # 保持和原模型相同 batchsize
-                                         # batch_size=len(asm_meta_dataset),  # 全部放到1个batch，bs一直在变，acc掉的快
                                          drop_last=False,
                                          shuffle=True, **kwargs)
 
-            # todo: 思考 meta_model 在新 dataset 的迁移能力?
             meta_losses, meta_accs = [], []
             for k in range(inner_meta_epochs):
-                torch.manual_seed(random.randint(0, 100))
-
-                # 与增大 num_meta 异曲同工
-                # 每次从 labelset 随机选出的 metadata 不一样
-                # meta_dataset = random_system_sample_meta_dataset(label_dataset,
-                #                                                  sort_cls_idxs_dict, args.num_meta)
-                # asm_meta_dataset = CIFAR(
-                #     data=np.append(meta_dataset.data, asm_inputs, axis=0),
-                #     targets=np.append(meta_dataset.targets, asm_targets, axis=0),
-                #     transform=transform_train
-                # )
-                # asm_meta_loader = DataLoader(asm_meta_dataset,
-                #                              batch_size=args.batch_size,  # 保持和原模型相同 batchsize
-                #                              # batch_size=len(asm_meta_dataset),  # 全部放到1个batch，bs一直在变，acc掉的快
-                #                              drop_last=False,
-                #                              shuffle=True, **kwargs)
-
+                torch.manual_seed(random.randint(0, 10000))
                 meta_loss, meta_acc = train_meta(asm_meta_loader, model, criterion,
                                                  optimizer_a,
                                                  step=f'{i + 1}.{k + 1}/{len(unlabel_loader)}',
@@ -285,33 +259,6 @@ def train_asm_epochs(model, meta_epochs, inner_meta_epochs=None, prefix='ASM'):
 
     return best_model, best_prec1, best_epoch, global_total_uc_idxs, global_total_hc_idxs
 
-
-"""
-使用 Adam 在 D_U 训练，再用 SGD 在 {D_L, D_U} 上 finetune
-
-batch asm with meta dataset
-
-steps
-1. train init_epochs on D_L
-2. infer on D_L, get P_L
-3. train meta_epochs on {D_M, D_U}
-    for B_U in D_U
-        infer on B_U, get {B_hc, B_uc}
-        get D_M by system-sampling on D_L
-        form B_asm = {D_M, B_hc, B_uc}
-        train n=1 iterations on B_asm
-    update P_L
-    collect {D_hc, D_uc}
-4. form D_finetune = {D_L, D_hc, D_uc}
-5. train finetune_epochs on D_finetune
-
-改进
-1. 控制 unlabel_dataloader 每次 shuffle 结果一样，使得每个 B_asm 在新的 epoch 不会再被选出
-    next epoch, global_total_uc 还是会增加，并且 current_total_uc 下降不多
-    每个 B_asm 或许要起作用了
-2. init train 训练更多 epoch，得到较好的 init_model
-3. finetune epoch 增多
-"""
 
 # exp
 exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_m{args.num_meta}_{get_curtime()}'

@@ -106,7 +106,7 @@ if __name__ == '__main__':
                    epoch, args.print_freq, writer)
 
         # evaluate on validation set
-        _, prec1 = evaluate(test_loader, model, criterion,
+        _, prec1 = validate(test_loader, model, criterion,
                             epoch, args.print_freq, writer)
 
         # remember best prec@1 and save checkpoint
