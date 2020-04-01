@@ -46,6 +46,7 @@ def fetch_ori_data(dataset, root):
     return cifar_
 
 
+
 def plt_samples(imgs, labels, class2names, cols=5):
     total_imgs = len(imgs)
     rows = total_imgs // cols
@@ -61,6 +62,7 @@ def plt_samples(imgs, labels, class2names, cols=5):
             ax.set_title(class2names[labels[i]])
 
     plt.show()
+
 
 
 if __name__ == '__main__':

@@ -16,8 +16,8 @@ import numpy as np
 import copy
 from optim.adabound import AdaBound
 
-from datasets.cls_datasets import CIFAR
-from datasets.imb_data_utils import get_imb_meta_test_datasets
+from datasets.cifar.dataset import CIFAR
+from datasets.build_imb_dataset import get_imb_meta_test_datasets
 
 from net import *
 from engine import *
@@ -82,8 +82,8 @@ params = [
     '--ratio', '1',  # 小样本
     '--init_epochs', '20',  # meta_epochs, finetune_epochs?
     '--epochs', '50',
-    '--ckpt', 'output/hope3_cifar10_imb1_s0.4_r1.0_Mar18_150115/rs32_epoch_19.pth',
-    '--tag', 'asm_novnet'
+    '--ckpt', 'output/asm_meta_cifar10_imb1_s0.4_r1.0_Mar19_202659/rs32_epoch_19.pth',
+    '--tag', 'asm_uc'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -106,25 +106,17 @@ label_loader = DataLoader(label_dataset,
                           shuffle=True, **kwargs)
 unlabel_loader = DataLoader(unlabel_dataset,  # DataLoader will cvt np to tensor
                             batch_size=args.batch_size,
-                            drop_last=False,
-                            shuffle=True, **kwargs)  # shuffle 能带来更稳定的 imb
+                            drop_last=False,  # todo: False 查看 unlabel 数量
+                            shuffle=False, **kwargs)  # shuffle 能带来更稳定的 imb
 test_loader = DataLoader(test_dataset,
                          batch_size=args.batch_size,
                          shuffle=False, **kwargs)
 
 
-def empty_x():
-    return np.empty([0] + list(label_dataset.data.shape[1:]), dtype='uint8')  # (0,32,32,3)
-
-
-def empty_y():
-    return np.empty([0], dtype='int64')
-
-
 def valid_save_model(epoch, model, vnet=None):
     global best_prec1, best_epoch, best_model
 
-    _, prec1 = evaluate(test_loader, model, criterion,
+    _, prec1 = validate(test_loader, model, criterion,
                         epoch, args.print_freq, writer)
 
     if prec1 > best_prec1:
@@ -156,52 +148,39 @@ def train_init_epochs(model, init_epochs):
     return best_model, best_prec1, best_epoch
 
 
-def train_asm_epochs(model, meta_epochs):
-    global best_prec1, best_epoch, best_model
-
-    for epoch in range(best_epoch + 1, meta_epochs):
-        adjust_lr(args.lr, optimizer_a, epoch, writer)
-
-        # directly on unlabel data
-        asm_train(unlabel_loader, model,
-                  criterion, optimizer_a,
-                  args.delta, uc_select_fn, args.uncertain_samples_size,
-                  epoch, args.print_freq, writer)
-
-        best_model, best_prec1, best_epoch = valid_save_model(epoch, model)
-
-    print(f'Finish asm train, best acc: {best_prec1}, best epoch: {best_epoch}')
-
-    return best_model, best_prec1, best_epoch
-
-
 """
-batch asm without vnet
+batch asm with meta dataset
 
 steps
 1. train init_epochs on D_L
-2. infer on D_L
+2. infer on D_L, get P_L
 3. train meta_epochs on {D_M, D_U}
     for B_U in D_U
         infer on B_U, get {B_hc, B_uc}
-        form B_asm = {B_hc, B_uc}
+        get D_M by system-sampling on D_L
+        form B_asm = {D_M, B_hc, B_uc}
         train n=1 iterations on B_asm
+    update P_L
     collect {D_hc, D_uc}
 4. form D_finetune = {D_L, D_hc, D_uc}
 5. train finetune_epochs on D_finetune
 """
 
+# exp
+os.makedirs('exp', exist_ok=True)
+exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_m{args.num_meta}_{get_curtime()}'
+dump_json(vars(args), out_path=f'exp/{exp}.json')
+print('exp:', exp)
+
+# tensorboard / log
+writer = SummaryWriter(log_dir=os.path.join('runs', exp))
+sys.stdout = Logger(f'exp/{exp}.log', sys.stdout)
+
+# output model
+model_save_dir = os.path.join('output', exp)
+os.makedirs(model_save_dir, exist_ok=True)
+
 if __name__ == '__main__':
-    exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_s{args.split}_r{args.ratio}_{get_curtime()}'
-    print('exp:', exp)
-
-    # exp_dir
-    os.makedirs('exp', exist_ok=True)
-    dump_json(vars(args), out_path=f'exp/{exp}.json')
-
-    writer = SummaryWriter(log_dir=os.path.join('runs', exp))
-    model_save_dir = os.path.join('output', exp)
-    os.makedirs(model_save_dir, exist_ok=True)
 
     # build model
     model = ResNet32(args.num_classes).cuda()
@@ -212,9 +191,11 @@ if __name__ == '__main__':
     optimizer_a = torch.optim.SGD(model.params(), args.lr,
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    # optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变，两部分 model 学习率不同
-    #                               momentum=args.momentum, nesterov=args.nesterov,
-    #                               weight_decay=args.weight_decay)
+
+    # Adam
+    # optimizer_a = torch.optim.Adam(model.params(),
+    #                                lr=1e-3,
+    #                                betas=(0.9, 0.999), eps=1e-8)
 
     criterion = nn.CrossEntropyLoss().cuda()
     uc_select_fn = get_select_fn(args.uncertain_criterion)
@@ -232,14 +213,80 @@ if __name__ == '__main__':
     # return best model
 
     # select meta data
-    # random.seed()
-    # sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
-    # meta_dataset = random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, args.num_meta)
+    random.seed()
     # valid_loader = DataLoader(meta_dataset,
     #                           batch_size=args.batch_size,
     #                           drop_last=False,
     #                           shuffle=True, **kwargs)
+    meta_epochs = 50
 
-    train_asm_epochs(model, meta_epochs=50)
+    global_total_uc_idxs = []
 
-    # todo: record shuffle unlabel idxs, and fine-tune
+    # epoch 29 reduce lr [20, 50]
+    for epoch in range(best_epoch + 1, meta_epochs):
+        # todo: early adjust lr
+        adjust_lr(args.lr, optimizer_a, epoch, writer)
+
+        # update sample probs
+        sort_cls_idxs_dict = sort_cls_samples(model, label_dataset, args.num_classes, criterion='lc')
+
+        begin_step = epoch * len(unlabel_loader)
+
+        total_uc_idxs = []
+
+        # img_idxs get the identical_img_idx of each unlabel sample
+        for i, (input, target, img_idxs) in enumerate(unlabel_loader):
+            # fetch asm data from unlabel loader
+            asm_inputs, asm_targets, hc_acc, hc_ratio, uc_ratio, uc_idxs = \
+                asm_split_batch_unlabel_samples(model, input, target,
+                                                args.delta,
+                                                uc_select_fn, args.uncertain_samples_size)
+            # gloal uc_idxs <- local uc_idxs
+            # 虽然 uc_ratio 从全局来看 < 50%，但尚不确定是否在不同 epoch 有不同的 uc_sample 选出
+            batch_uc_idxs = cvt_iter_to_list(img_idxs[uc_idxs], int)
+            total_uc_idxs.extend(batch_uc_idxs)
+
+            writer.add_scalars('ASM/ratios', {
+                'hc_ratio': hc_ratio,
+                'uc_ratio': uc_ratio
+            }, global_step=begin_step + i)
+            writer.add_scalar('ASM/hc_acc', hc_acc, global_step=begin_step + i)
+
+            # select subset from labelset
+            # todo: batch 样本的随机性体现在这里，可以引入更复杂的 hard meta_dataset
+            meta_dataset = random_system_sample_meta_dataset(label_dataset,
+                                                             sort_cls_idxs_dict, args.num_meta)
+            asm_meta_dataset = CIFAR(
+                data=np.append(meta_dataset.data, asm_inputs, axis=0),
+                targets=np.append(meta_dataset.targets, asm_targets, axis=0),
+                transform=transform_train
+            )
+            asm_meta_loader = DataLoader(asm_meta_dataset,
+                                         batch_size=args.batch_size,  # 保持和原模型相同 batchsize
+                                         # batch_size=len(asm_meta_dataset),  # 全部放到1个batch，bs一直在变，acc 掉的快
+                                         drop_last=False,
+                                         shuffle=True, **kwargs)
+
+            meta_losses, meta_accs = [], []
+            for _ in range(1):  # meta_train 在同一批次训练多次反而不好!
+                meta_loss, meta_acc = train_meta(asm_meta_loader, model, criterion,
+                                                 optimizer_a,
+                                                 step=f'{i}/{len(unlabel_loader)}', print_freq=1)
+                meta_losses.append(meta_loss)
+                meta_accs.append(meta_acc)
+
+            writer.add_scalar('ASM/train_loss', np.mean(meta_losses), global_step=begin_step + i)
+            writer.add_scalar('ASM/train_acc', np.mean(meta_accs), global_step=begin_step + i)
+
+        # 获取每个 asm epoch 之后并集，为全局使用的 uc_samples
+        global_total_uc_idxs = list(set(global_total_uc_idxs) | set(total_uc_idxs))
+
+        writer.add_scalars('ASM/total_uc', {  # 理想状态
+            'current': len(total_uc_idxs),  # 持续下降
+            'global': len(global_total_uc_idxs)  # 保持稳定
+        }, global_step=epoch)
+
+        # valid after each asm bach
+        valid_save_model(epoch, model)
+
+    print(f'Finish train, best acc: {best_prec1}, best epoch: {best_epoch}')

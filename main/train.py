@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import random
-from datasets.imb_data_utils import get_imb_meta_test_datasets
+from datasets.build_imb_dataset import get_imb_meta_test_datasets
 from net.resnet import ResNet32
 from pprint import pprint
 from utils import get_curtime, save_model

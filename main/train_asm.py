@@ -13,14 +13,14 @@ from pprint import pprint
 import random
 import numpy as np
 
-from datasets.cls_datasets import CIFAR
-from datasets.imb_data_utils import get_imb_meta_test_datasets, transform_train, transform_test
+from datasets.cifar.dataset import CIFAR
+from datasets.build_imb_dataset import get_imb_meta_test_datasets, transform_train, transform_test
 from net.resnet import ResNet32
 from optim.adabound import AdaBound
 from utils import get_curtime, save_model
 
 from engine import adjust_lr, train_base, validate
-from utils import detect_unlabel_imgs, get_select_fn, get_high_conf_samples
+from utils import detect_unlabel_imgs, get_select_fn, get_hc_samples
 
 parser = argparse.ArgumentParser(description='Classification on cifar10')
 parser.add_argument('--dataset', default='cifar10', type=str,
@@ -194,7 +194,7 @@ if __name__ == '__main__':
             # 2.1 add hc samples to label_loader, not add to label_dataset(only labeled)
             # Self Learning [machine label]
             if args.cost_effective:
-                hc_idxs, hc_preds = get_high_conf_samples(y_pred_prob, args.delta)  # entropy thre, note num_classes
+                hc_idxs, hc_preds = get_hc_samples(y_pred_prob, args.delta)  # entropy thre, note num_classes
                 hc_ratio = len(hc_idxs) / len(unlabel_dataset)
                 writer.add_scalar('ASM/hc_ratio', hc_ratio, global_step=epoch)
 
