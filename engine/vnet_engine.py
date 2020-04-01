@@ -20,10 +20,6 @@ def train_with_vnet(train_loader, valid_loader,
 
     model.train()
 
-    # todo: 验证 meta_dataset 是否需要更新
-    # train_loader 是否需要每个 epoch 后更新
-    # 不更新，最后统一计算 uc samples，code 简单
-
     for i, (input, target) in enumerate(train_loader):
         input_var = to_var(input, requires_grad=False)
         target_var = to_var(target, requires_grad=False)

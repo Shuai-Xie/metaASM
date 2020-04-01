@@ -4,7 +4,8 @@ from utils import AverageMeter, to_var
 
 def update_lr(lr, epoch):
     # lr = lr * (0.1 ** int(epoch >= 40))
-    lr = lr * ((0.1 ** int(epoch >= 40)) * (0.1 ** int(epoch >= 45)))
+    lr = lr * ((0.1 ** int(epoch >= 30)) * (0.1 ** int(epoch >= 40)))
+    # lr = lr * ((0.1 ** int(epoch >= 40)) * (0.1 ** int(epoch >= 45)))
     # lr = lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 90)))
     # lr = lr * ((0.1 ** int(epoch >= 40)) * (0.1 ** int(epoch >= 60)) * (0.1 ** int(epoch >= 70)))
     return lr
@@ -41,8 +42,8 @@ def accuracy(output, target, topk=(1,)):
 
 
 @torch.no_grad()
-def evaluate(valid_loader, model, criterion,
-             epoch, print_freq, writer=None):
+def validate(valid_loader, model, criterion,
+             epoch, print_freq, writer=None, prefix='Test'):
     """Perform validation on the validation set"""
     model.eval()
     losses = AverageMeter()
@@ -72,15 +73,15 @@ def evaluate(valid_loader, model, criterion,
     print(' * Prec@1 {top1.avg:.3f}'.format(top1=top1))
 
     if writer:
-        writer.add_scalar('Test/loss', losses.avg, global_step=epoch)
-        writer.add_scalar('Test/top1_acc', top1.avg, global_step=epoch)
+        writer.add_scalar(f'{prefix}/test_loss', losses.avg, global_step=epoch)
+        writer.add_scalar(f'{prefix}/test_acc', top1.avg, global_step=epoch)
 
     return losses.avg, top1.avg
 
 
-def train_base(train_loader, model,
-               criterion, optimizer_a,
-               epoch, print_freq, writer):
+def train_base(train_loader, model, criterion,
+               optimizer_a,
+               epoch, print_freq, writer=None, prefix='Train'):
     model.train()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -104,13 +105,17 @@ def train_base(train_loader, model,
         losses.update(loss.item(), input.size(0))
         top1.update(prec_train.item(), input.size(0))
 
-        writer.add_scalar('Train/loss', losses.avg, global_step=begin_step + i)
+        if writer:
+            writer.add_scalar(f'{prefix}/train_loss', losses.avg, global_step=begin_step + i)
 
         # idx in trainloader
-        if (i + 1) % print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                epoch, i + 1, len(train_loader), loss=losses, top1=top1))
+        if print_freq:
+            if (i + 1) % print_freq == 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                    epoch, i + 1, len(train_loader), loss=losses, top1=top1))
 
-    writer.add_scalar('Train/top1_acc', top1.avg, global_step=epoch)
+    if writer:
+        writer.add_scalar(f'{prefix}/train_loss_epoch', losses.avg, global_step=epoch)
+        writer.add_scalar(f'{prefix}/train_acc', top1.avg, global_step=epoch)
