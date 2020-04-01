@@ -1,10 +1,11 @@
 import torch
 import numpy as np
-
-from datasets.cls_datasets import CIFAR
-from datasets.imb_data_utils import get_cls_img_idxs_dict, transform_train
-from utils.asm_utils import detect_unlabel_imgs, get_select_fn
 import random
+
+from datasets import CIFAR
+from datasets.dataset_utils import get_cls_img_idxs_dict
+from datasets.transforms import transform_train
+from utils.asm_utils import detect_unlabel_imgs, get_select_fn
 
 """
 sort each cls samples by criterion
@@ -15,6 +16,7 @@ sort each cls samples by criterion
 def sort_cls_samples(model, label_dataset, num_classes, criterion='lc'):
     # 每类图片 idxs
     cls_img_idxs = get_cls_img_idxs_dict(label_dataset.targets, num_classes)
+
     y_pred_prob = detect_unlabel_imgs(model, label_dataset.data, num_classes, bs=100)  # [N,10] prob vector
 
     sort_cls_idxs_dict = {}
@@ -43,7 +45,7 @@ build meta dataset by different sampling methods
 
 
 def build_meta_dataset(label_dataset, idx_to_meta):
-    random.shuffle(idx_to_meta)  # 原本各类按顺序
+    random.shuffle(idx_to_meta)  # 原本 samples 按 cls 顺序排列
 
     meta_dataset = CIFAR(
         data=np.take(label_dataset.data, idx_to_meta, axis=0),
@@ -62,7 +64,16 @@ def random_sample_meta_dataset(label_dataset, num_meta, num_classes):
     return build_meta_dataset(label_dataset, idx_to_meta)
 
 
+def random_sample_equal_cls(label_dataset, cls_img_idxs_dict, num_meta):
+    idx_to_meta = []
+    for cls, img_idxs in cls_img_idxs_dict.items():
+        idx_to_meta.extend(random.sample(img_idxs, num_meta))
+
+    return build_meta_dataset(label_dataset, idx_to_meta)
+
+
 # random sample in a systematic way, loyal to original data distribution
+# cover all hard-level samples
 def random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, num_meta, mid=None):  # 等距抽样
     idx_to_meta = []
 
@@ -75,11 +86,22 @@ def random_system_sample_meta_dataset(label_dataset, sort_cls_idxs_dict, num_met
     return build_meta_dataset(label_dataset, idx_to_meta)
 
 
-# sample best train on label_dataset
-def sample_best_train_meta_dataset(label_dataset, sort_cls_idxs_dict, num_meta):
+# sample top hard samples on label_dataset
+# 不带随机后，选出的样本固定了...
+def sample_top_hard_meta_dataset(label_dataset, sort_cls_idxs_dict, num_meta):
     idx_to_meta = []
 
-    for cls, img_idxs in sort_cls_idxs_dict.items():
-        idx_to_meta.extend(img_idxs[-num_meta:])  # 最可信的
+    for cls, img_idxs in sort_cls_idxs_dict.items():  # 各类按难度降序排列
+        idx_to_meta.extend(img_idxs[:num_meta])
+
+    return build_meta_dataset(label_dataset, idx_to_meta)
+
+
+# sample top easy samples on label_dataset
+def sample_top_easy_meta_dataset(label_dataset, sort_cls_idxs_dict, num_meta):
+    idx_to_meta = []
+
+    for cls, img_idxs in sort_cls_idxs_dict.items():  # 各类按难度降序排列
+        idx_to_meta.extend(img_idxs[-num_meta:])
 
     return build_meta_dataset(label_dataset, idx_to_meta)

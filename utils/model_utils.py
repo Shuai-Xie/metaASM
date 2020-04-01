@@ -33,5 +33,5 @@ def save_model(ckpt_path, model, epoch, accuracy, optimizer=None):
     }
     if optimizer is not None:
         ckpt['optimizer'] = optimizer.state_dict()
-    torch.save(ckpt, ckpt_path)
+    torch.save(ckpt, ckpt_path)  # 可以覆盖保存
     print('save {}, epoch {}'.format(ckpt_path, ckpt['epoch']))
