@@ -21,9 +21,9 @@ from datasets import *
 from datasets.build_imb_dataset import get_imb_meta_test_datasets
 
 from net import *
-from optim import AdaBound
 from engine import *
 from utils import *
+from optim import *
 
 parser = argparse.ArgumentParser(description='Classification on cifar10')
 parser.add_argument('--dataset', default='cifar10', type=str,
@@ -203,6 +203,9 @@ if __name__ == '__main__':
     optimizer_a = torch.optim.Adam(model.params(),
                                    lr=1e-3,
                                    betas=(0.9, 0.999), eps=1e-8)
+    # optimizer_a = AdamW(model.params(),
+    #                     lr=1e-3,
+    #                     betas=(0.9, 0.999), eps=1e-8)
 
     criterion = nn.CrossEntropyLoss().cuda()
     uc_select_fn = get_select_fn(args.uncertain_criterion)
@@ -223,7 +226,7 @@ if __name__ == '__main__':
     torch.manual_seed(args.seed)  # 控制 B_U 相同，且均衡
 
     ab_acc_caches = AccCaches(patience=5)  # ab: asm_batch
-    ab_acc_caches_dict = {}  # key: B_U idx
+    # ab_acc_caches_dict = {}  # key: B_U idx
     global_uc_idxs = []
 
     epoch = best_epoch + 1
@@ -233,8 +236,7 @@ if __name__ == '__main__':
 
         ab_epoch = 0
         ab_acc_caches.reset()
-        ab_acc_caches_dict[i] = {}  # key: ab_epoch
-        batch_all_uc_idxs = []  # record total uc_samples in a B_U
+        # ab_acc_caches_dict[i] = {}  # key: ab_epoch
 
         model = best_model
         best_ab_epoch = -1
@@ -254,6 +256,12 @@ if __name__ == '__main__':
         prefix = f'ASM_{i}'  # B_U idxs
         print(f'begin {prefix} train')
 
+        # cvt tensor to np
+        input_np, target_np = input.numpy().astype('uint8'), target.numpy().astype('int64')
+        img_idxs = img_idxs.numpy().astype('int64')
+
+        batch_all_uc_idxs = np.array([], dtype=np.int)  # record total uc_samples in a B_U，慎用 empty
+
         while True:
             ab_epoch += 1
 
@@ -261,43 +269,30 @@ if __name__ == '__main__':
             # results = asm_split_hc_uc_delta(model, input, target,
             #                                 args.hc_delta,
             #                                 args.uc_delta)
-            results = asm_split_hc_delta_uc_K(model, input, target,
+            results = asm_split_hc_delta_uc_K(model, input_np, target_np,  # 可保证最终未标注拥有更高准确率
                                               args.hc_delta,
                                               uc_select_fn, args.uncertain_samples_size)
+            # input 顺序固定，可以在 while 之外映射到 global uc_idxs
 
             # uc
-            batch_cur_uc_idxs = cvt_iter_to_list(img_idxs[results['uc']['idxs']], type=int)
-            batch_all_uc_idxs = list(set(batch_all_uc_idxs) | set(batch_cur_uc_idxs))  # gts
+            batch_cur_uc_idxs = results['uc']['idxs']  # idxs in input range
+            batch_all_uc_idxs = np.union1d(batch_all_uc_idxs, batch_cur_uc_idxs)  # gts
 
-            # 之前 ab_epoch 积累的 uc_samples 在当前 ab_epoch 自然可以作为 gt 引入使用
-            uc_data = unlabel_dataset.data[batch_all_uc_idxs]
-            uc_targets = unlabel_dataset.targets[batch_all_uc_idxs]  # gts
-            # uc_data, uc_targets = multi_uc_data(uc_data,uc_targets,factor=2)
-
-            # writer.add_scalars(f'{prefix}/ratios', {
-            #     'hc_ratio': results['hc']['ratio'],
-            #     'uc_ratio': results['uc']['ratio']
-            # }, global_step=ab_epoch)
-            # writer.add_scalars(f'{prefix}/accs', {
-            #     'hc_acc': results['hc']['acc'],
-            #     'uc_acc': results['uc']['acc']
-            # }, global_step=ab_epoch)
-            # writer.add_scalars(f'{prefix}/uc_sample', {  # 理想状态
-            #     'cur': len(batch_cur_uc_idxs),  # 持续下降
-            #     'all': len(batch_all_uc_idxs)  # 保持稳定
-            # }, global_step=ab_epoch)
-
-            # 如果 hc_idx 已在 all_uc_idxs 中出现，过滤掉，使用 gt
-
-            # hc
-            hc_idxs, hc_data, hc_targets = results['hc']['idxs'], results['hc']['data'], results['hc']['targets']
-            keep_idxs = [k for k in range(len(hc_idxs)) if img_idxs[hc_idxs[k]] not in batch_all_uc_idxs]
-            hc_data, hc_targets = hc_data[keep_idxs], hc_targets[keep_idxs]  # preds
-
+            # B_U 只采用当前 ab_epoch 划分结果
             # hc:uc = 1:2
             # hc_data, hc_targets = results['hc']['data'], results['hc']['targets']
             # uc_data, uc_targets = results['uc']['data'], results['uc']['targets']
             # uc_data, uc_targets = multi_uc_data(uc_data, uc_targets, factor=2)
+
+            # B_U 也采用之前 ab_epoch 选出的总共 uc_samples，因为已经标注了，自然也作为 gt 使用
+            uc_data, uc_targets = input_np[batch_all_uc_idxs], target_np[batch_all_uc_idxs]  # gts
+            # uc_data, uc_targets = multi_uc_data(uc_data,uc_targets,factor=2)
+
+            # hc
+            # 如果 hc_idx 已在 all_uc_idxs 中出现，过滤掉，使用 gt
+            hc_idxs, hc_data, hc_targets = results['hc']['idxs'], results['hc']['data'], results['hc']['targets']
+            keep_idxs = [k for k in range(len(hc_idxs)) if hc_idxs[k] not in batch_all_uc_idxs]  # idx k in hc range
+            hc_data, hc_targets = hc_data[keep_idxs], hc_targets[keep_idxs]  # preds
 
             asm_meta_dataset = CIFAR(
                 data=np.vstack((meta_dataset.data, uc_data, hc_data)),
@@ -326,18 +321,17 @@ if __name__ == '__main__':
 
             if ab_acc_caches.full():  # 从 >= patience 开始记录
                 print('ab acc caches:', ab_acc_caches.accs)
-                print(f'{prefix} best acc:', best_ab_epoch, best_acc)
-                ab_acc_caches_dict[i][ab_epoch] = {
-                    'ab_acc_caches': str(ab_acc_caches.accs),  # 序列化为 str, 存入 json
-                    'best_acc': str([best_ab_epoch, best_acc])
-                }
+                print(f'{prefix} best acc:', best_ab_epoch, best_acc)  # 如果没有就是 -1
+                # ab_acc_caches_dict[i][ab_epoch] = {
+                #     'ab_acc_caches': str(ab_acc_caches.accs),  # 序列化为 str, 存入 json
+                #     'best_acc': str([best_ab_epoch, best_acc])
+                # }
                 _, max_acc = ab_acc_caches.max_cache_acc()
                 if max_acc < best_acc:
                     print(f'Finish {prefix} train, best acc: {best_acc}, best ab_epoch: {best_ab_epoch}')
                     break
 
-        # save asm batch acc_caches log
-        dump_json(ab_acc_caches_dict, out_path=f'{exp_dir}/asm_batch_acc_caches.json')
+        batch_all_uc_idxs = img_idxs[batch_all_uc_idxs]  # cvt to global
 
         # update labelset
         label_dataset = CIFAR(
@@ -350,9 +344,13 @@ if __name__ == '__main__':
             'unlabel': 50000 - len(label_dataset),
         }, global_step=i)
         writer.add_scalar('ASM/test_acc', best_acc, global_step=i)  # i: B_U idx
-        writer.add_scalar('ASM/uc_sample', len(batch_all_uc_idxs), global_step=i)
+        writer.add_scalar('ASM/batch_epochs', ab_epoch, global_step=i)  # last ab_epoch is the num of batch_epochs
+        writer.add_scalar('ASM/batch_uc_sample', len(batch_all_uc_idxs), global_step=i)
 
-        global_uc_idxs.extend(batch_all_uc_idxs)
+        global_uc_idxs.extend(batch_all_uc_idxs.tolist())
+
+    # save asm batch acc_caches log
+    # dump_json(ab_acc_caches_dict, out_path=f'{exp_dir}/asm_batch_acc_caches.json')
 
     # update final unlabel dataset, hc
     unlabel_dataset = CIFAR_unlabel(
