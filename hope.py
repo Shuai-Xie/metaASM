@@ -92,9 +92,10 @@ params = [
     '--max_uc_ratio', '0.5',
     '--split', '0.4',
     '--ratio', '1',  # 小样本
-    '--ckpt', 'output/hope_cifar10_imb1_s0.4_r1.0_m300_Mar29_173550/init_model.pth',
-    # '--ckpt_asm', 'output/hope_cifar10_imb1_s0.4_r1.0_m50_Mar23_201207/rs32_epoch_59.pth',
-    '--tag', 'hope'
+    # '--ckpt', 'output/padam4_cifar10_imb1_s0.4_r1.0_m300_Apr03_114830/init_model.pth',
+    # '--ckpt_asm', 'output/padam4_cifar10_imb1_s0.4_r1.0_m300_Apr02_224414/asm_model.pth',
+    # '--ckpt_asm', 'output/padam8_cifar10_imb1_s0.4_r1.0_m300_Apr03_114956/asm_model.pth',
+    '--tag', 'padam4_wd'
 ]
 args = parser.parse_args(params)
 args.uncertain_samples_size = int(args.uc_batchsize * args.max_uc_ratio)
@@ -152,91 +153,159 @@ best_model, best_acc, best_epoch = None, 0, 0
 acc_caches = AccCaches(patience=args.patience)
 
 
-def train_init_epochs(model, prefix='Init', ckpt='init_model.pth'):
+def valid_save_model(model, epoch, acc_caches, optimizer, prefix, ckpt):
     global best_model, best_acc, best_epoch
 
+    # valid
+    _, acc = validate(test_loader, model, criterion,
+                      epoch, args.print_freq, writer, prefix)
+
+    acc_rise = False  # flag to re infer on hc
+    if acc > best_acc:
+        best_model, best_acc, best_epoch = model, acc, epoch
+        save_model(f'{model_save_dir}/{ckpt}', best_model, best_epoch, best_acc, optimizer)  # 覆盖保存
+        print(f'{prefix} epoch {epoch}, best acc: {best_acc}, best epoch: {best_epoch}')
+        acc_rise = True
+
+    acc_caches.add(epoch, acc)
+
+    # 实际启动条件：
+    # best_acc 之后 patience epochs 内 best_acc 无上升
+    # 而不是每次都从 patience 中选取最优 epoch 作为下次训练 model
+    stop_train = False
+    if acc_caches.full():
+        print('acc caches:', acc_caches.accs)
+        print('best acc:', best_epoch, best_acc)
+        _, max_acc = acc_caches.max_cache_acc()
+        if max_acc < best_acc:  # stop train
+            stop_train = True
+
+    return stop_train, acc_rise
+
+
+def train_init_epochs(model, prefix='Init', ckpt='init_model.pth'):
     epoch = best_epoch
     acc_caches.reset()
-    acc_caches_dict = {}  # key: epoch
 
     while True:
         epoch += 1
-
         # train
         train_base(label_loader, model, criterion,
                    optimizer_a,
                    epoch, args.print_freq, writer, prefix)
         # valid
-        _, acc = validate(test_loader, model, criterion,
-                          epoch, args.print_freq, writer, prefix)
+        stop_train, _ = valid_save_model(model, epoch, acc_caches, optimizer_a, prefix, ckpt)
 
-        if acc > best_acc:
-            best_model, best_acc, best_epoch = model, acc, epoch
-            # todo: 保存 optimizer, Adam 需要吗？
-            save_model(f'{model_save_dir}/{ckpt}', best_model, best_epoch, best_acc)  # 覆盖保存
-            print(f'{prefix} epoch {epoch}, best acc: {best_acc}, best epoch: {best_epoch}')
-
-        acc_caches.add(epoch, acc)
-
-        # 实际启动条件：
-        # best_acc 之后 patience epochs 内 best_acc 无上升
-        # 而不是每次都从 patience 中选取最优 epoch 作为下次训练 model
-        if acc_caches.full():
-            print('acc caches:', acc_caches.accs)
-            print('best acc:', best_epoch, best_acc)
-            acc_caches_dict[epoch] = {
-                'acc_caches': str(acc_caches.accs),  # 序列化为 str, 存入 json
-                'best_acc': str([best_epoch, best_acc])
-            }
-            _, max_acc = acc_caches.max_cache_acc()
-            if max_acc < best_acc:  # stop train
-                dump_json(acc_caches_dict, out_path=f'{exp_dir}/{prefix}_acc_caches.json')
-                return best_model, best_acc, best_epoch
+        if stop_train:
+            break
 
 
-if __name__ == '__main__':
-    # build model
-    model = ResNet32(args.num_classes).cuda()
-    print('build model done!')
+def get_asm_dataloader(model, epoch, prefix='Finetune'):
+    hc_data, hc_targets = unlabel_dataset.data, unlabel_dataset.targets
 
-    # Adam
-    optimizer_a = torch.optim.Adam(model.params(),
-                                   lr=1e-3,
-                                   betas=(0.9, 0.999), eps=1e-8)
-    # optimizer_a = AdamW(model.params(),
-    #                     lr=1e-3,
-    #                     betas=(0.9, 0.999), eps=1e-8)
+    hc_probs = detect_unlabel_imgs(model, hc_data, args.num_classes)
+    hc_idxs, hc_preds = get_hc_samples(hc_probs, args.hc_delta)
+    hc_ratio = len(hc_idxs) / len(hc_probs)
 
-    criterion = nn.CrossEntropyLoss().cuda()
-    uc_select_fn = get_select_fn(args.uncertain_criterion)
-
-    ## init train
-    if args.ckpt is not None:
-        print('load init_trained model')
-        best_model, optimizer_a, best_acc, best_epoch = load_model(model, args.ckpt, optimizer_a)
-        writer.add_scalar('Init/test_acc', best_acc, global_step=best_epoch)
+    if len(hc_idxs) > 0:
+        hc_gts = np.take(hc_targets, hc_idxs, axis=0)  # divide 0
+        hc_acc = sum(hc_preds == hc_gts) / len(hc_gts)
     else:
-        print(f'begin initial train')
-        best_model, best_acc, best_epoch = train_init_epochs(model, prefix='Init', ckpt='init_model.pth')
+        hc_acc = 0
 
-    print(f'Finish init train, best acc: {best_acc}, best epoch: {best_epoch}')
+    writer.add_scalar(f'{prefix}/hc_ratio', hc_ratio, global_step=epoch)
+    writer.add_scalar(f'{prefix}/hc_acc', hc_acc, global_step=epoch)
 
-    ## asm train
+    asm_dataset = CIFAR(
+        data=np.vstack((label_dataset.data, hc_data[hc_idxs])),
+        targets=np.hstack((label_dataset.targets, hc_preds)),
+        transform=transform_train
+    )
+    asm_dataloader = DataLoader(asm_dataset,
+                                batch_size=args.batch_size,  # 保持和原模型相同 batchsize
+                                shuffle=True, **kwargs)
+
+    return asm_dataloader
+
+
+def train_finetune_epochs(model, hc_interval=5, prefix='Finetune', ckpt='finetune_model.pth'):
+    epoch = best_epoch
+    acc_caches = AccCaches(patience=5)  #
+    acc_caches.reset()
+
+    # asm_dataloader = get_asm_dataloader(model, epoch)
+
+    # only label
+    asm_dataloader = DataLoader(label_dataset,
+                                batch_size=args.batch_size,
+                                shuffle=True, **kwargs)
+
+    # total
+    # asm_dataset = CIFAR(
+    #     data=np.vstack((label_dataset.data, unlabel_dataset.data)),
+    #     targets=np.hstack((label_dataset.targets, unlabel_dataset.targets)),
+    #     transform=transform_train
+    # )
+    # asm_dataloader = DataLoader(asm_dataset,
+    #                             batch_size=args.batch_size,
+    #                             shuffle=True, **kwargs)
+
+    # finetune_lr = 1e-2
+    # optimizer_a = torch.optim.SGD(model.params(), finetune_lr,
+    #                               momentum=args.momentum, nesterov=True,
+    #                               weight_decay=args.weight_decay)
+
+    # finetune_lr = 3e-4
+    # optimizer_a = AdamW(model.params(),
+    #                     lr=finetune_lr,
+    #                     betas=(0.9, 0.999), eps=1e-8, amsgrad=True)
+
+    # optimizer_a = SWATS(model.params(),
+    #                     lr=1e-3,
+    #                     betas=(0.9, 0.999), eps=1e-8, amsgrad=True,
+    #                     weight_decay=args.weight_decay, nesterov=args.nesterov)
+
+    while True:
+        epoch += 1
+        torch.manual_seed(random.randint(0, 10000))
+        cur_lr = get_lr(optimizer_a)
+        print('current lr:', cur_lr)
+        writer.add_scalar(f'{prefix}/lr', cur_lr, global_step=epoch)
+
+        # train
+        train_base(asm_dataloader, model, criterion,
+                   optimizer_a,
+                   epoch, args.print_freq, writer, prefix)
+        # valid
+        stop_train, acc_rise = valid_save_model(model, epoch, acc_caches, optimizer_a, prefix, ckpt)
+
+        # if acc_rise:
+        #     asm_dataloader = get_asm_dataloader(model, epoch)
+
+        # if stop_train:
+        #     break
+
+        if stop_train:  # 停下训练，自动减小 lr，默认一定有 finetune_model.pth
+            # model, optimizer_a, _, _ = load_model(model, f'{model_save_dir}/{ckpt}', optimizer_a)
+            cur_lr /= 10
+            if cur_lr < 1e-4:
+                break
+            set_lr(cur_lr, optimizer_a)
+            acc_caches.reset()
+
+
+def train_asm_epochs(label_dataset, unlabel_dataset):
+    global best_model, best_acc, best_epoch
+
+    epoch = best_epoch + 1
+    ab_acc_caches = AccCaches(patience=3)  # ab: asm_batch
+    global_uc_idxs = []
 
     torch.manual_seed(args.seed)  # 控制 B_U 相同，且均衡
 
-    ab_acc_caches = AccCaches(patience=5)  # ab: asm_batch
-    # ab_acc_caches_dict = {}  # key: B_U idx
-    global_uc_idxs = []
-
-    epoch = best_epoch + 1
-
     for i, (input, target, img_idxs) in enumerate(unlabel_loader):
-        # todo: 使用 acc_caches 在每个 B_U 上 asm 多次，查看每次 model 选出的样本是否有很大不同
-
         ab_epoch = 0
         ab_acc_caches.reset()
-        # ab_acc_caches_dict[i] = {}  # key: ab_epoch
 
         model = best_model
         best_ab_epoch = -1
@@ -272,7 +341,7 @@ if __name__ == '__main__':
             results = asm_split_hc_delta_uc_K(model, input_np, target_np,  # 可保证最终未标注拥有更高准确率
                                               args.hc_delta,
                                               uc_select_fn, args.uncertain_samples_size)
-            # input 顺序固定，可以在 while 之外映射到 global uc_idxs
+            # input 顺序固定，可在 while 之外映射到 global uc_idxs
 
             # uc
             batch_cur_uc_idxs = results['uc']['idxs']  # idxs in input range
@@ -284,7 +353,7 @@ if __name__ == '__main__':
             # uc_data, uc_targets = results['uc']['data'], results['uc']['targets']
             # uc_data, uc_targets = multi_uc_data(uc_data, uc_targets, factor=2)
 
-            # B_U 也采用之前 ab_epoch 选出的总共 uc_samples，因为已经标注了，自然也作为 gt 使用
+            # B_U 采用之前 ab_epoch 选出的总共 uc_samples，因为已经标注了，自然也作为 gt 使用
             uc_data, uc_targets = input_np[batch_all_uc_idxs], target_np[batch_all_uc_idxs]  # gts
             # uc_data, uc_targets = multi_uc_data(uc_data,uc_targets,factor=2)
 
@@ -305,9 +374,9 @@ if __name__ == '__main__':
                                          shuffle=True, **kwargs)
 
             # train, note: 不要用错 dataloader
-            train_base(asm_meta_loader, model, criterion,
-                       optimizer_a,
-                       epoch, args.print_freq)  # not record to tensorboard
+            train_loss, train_acc = train_base(asm_meta_loader, model, criterion,
+                                               optimizer_a,
+                                               epoch, args.print_freq)  # not record to tensorboard
             # valid
             _, acc = validate(test_loader, model, criterion,
                               epoch, args.print_freq)
@@ -321,11 +390,7 @@ if __name__ == '__main__':
 
             if ab_acc_caches.full():  # 从 >= patience 开始记录
                 print('ab acc caches:', ab_acc_caches.accs)
-                print(f'{prefix} best acc:', best_ab_epoch, best_acc)  # 如果没有就是 -1
-                # ab_acc_caches_dict[i][ab_epoch] = {
-                #     'ab_acc_caches': str(ab_acc_caches.accs),  # 序列化为 str, 存入 json
-                #     'best_acc': str([best_ab_epoch, best_acc])
-                # }
+                print(f'{prefix} best acc:', best_ab_epoch, best_acc)  # 如果没有提升 就是 -1
                 _, max_acc = ab_acc_caches.max_cache_acc()
                 if max_acc < best_acc:
                     print(f'Finish {prefix} train, best acc: {best_acc}, best ab_epoch: {best_ab_epoch}')
@@ -343,14 +408,15 @@ if __name__ == '__main__':
             'label': len(label_dataset),
             'unlabel': 50000 - len(label_dataset),
         }, global_step=i)
-        writer.add_scalar('ASM/test_acc', best_acc, global_step=i)  # i: B_U idx
+        writer.add_scalars('ASM/acc', {
+            'train': train_acc,
+            'test': best_acc
+        }, global_step=i)
+        writer.add_scalar('ASM/train_loss', train_loss, global_step=i)  # i: B_U idx
         writer.add_scalar('ASM/batch_epochs', ab_epoch, global_step=i)  # last ab_epoch is the num of batch_epochs
         writer.add_scalar('ASM/batch_uc_sample', len(batch_all_uc_idxs), global_step=i)
 
         global_uc_idxs.extend(batch_all_uc_idxs.tolist())
-
-    # save asm batch acc_caches log
-    # dump_json(ab_acc_caches_dict, out_path=f'{exp_dir}/asm_batch_acc_caches.json')
 
     # update final unlabel dataset, hc
     unlabel_dataset = CIFAR_unlabel(
@@ -358,14 +424,69 @@ if __name__ == '__main__':
         targets=np.delete(unlabel_dataset.targets, global_uc_idxs, axis=0),
         transform=None
     )
-    print('global len:', len(global_uc_idxs))
-    print('labelset:', len(label_dataset))
-    print('unlabelset:', len(unlabel_dataset))
 
+    # save for retrain
     asm_result = {
         'labelset': (label_dataset.data, label_dataset.targets),  # pickle can't save lambda
         'unlabelset': (unlabel_dataset.data, unlabel_dataset.targets),
-        'best_acc': best_acc,
-        'best_epoch': best_epoch
     }
     dump_pickle(asm_result, out_path=f'{exp_dir}/asm_result.pkl')
+
+    return label_dataset, unlabel_dataset
+
+
+if __name__ == '__main__':
+    # build model
+    model = ResNet32(args.num_classes).cuda()
+    print('build model done!')
+
+    # Adam
+    # optimizer_a = torch.optim.Adam(model.params(),
+    #                                lr=1e-3,
+    #                                betas=(0.9, 0.999), eps=1e-8, amsgrad=True)  # 加 ams 训练略慢
+
+    # optimizer_a = AdamW(model.params(),
+    #                     lr=1e-3,
+    #                     betas=(0.9, 0.999), eps=1e-8, amsgrad=True)
+
+    optimizer_a = Padam(model.params(),
+                        lr=1e-1,
+                        betas=(0.9, 0.999), eps=1e-8,
+                        weight_decay=args.weight_decay,
+                        partial=1 / 4)
+
+    criterion = nn.CrossEntropyLoss().cuda()
+    uc_select_fn = get_select_fn(args.uncertain_criterion)
+
+    # init train
+
+    if args.ckpt is not None:
+        print('load init_trained model')
+        best_model, optimizer_a, best_acc, best_epoch = load_model(model, args.ckpt, optimizer_a)
+        writer.add_scalar('Init/test_acc', best_acc, global_step=best_epoch)
+    else:
+        if args.ckpt_asm is None:
+            print('begin init train')
+            train_init_epochs(model, prefix='Init', ckpt='init_model.pth')  # best save as global
+
+    print(f'Finish init train, best acc: {best_acc}, best epoch: {best_epoch}')
+
+    # asm train
+    if args.ckpt_asm is not None:
+        print('load asm model')
+        best_model, optimizer_a, best_acc, best_epoch = load_model(model, args.ckpt_asm, optimizer_a)
+        writer.add_scalar('ASM/test_acc', best_acc, global_step=best_epoch)
+        # load batch asm split whole dataset
+        asm_result = load_pickle(f'exp/{args.ckpt_asm.split("/")[1]}/asm_result.pkl')
+        label_dataset = CIFAR(asm_result['labelset'][0], asm_result['labelset'][1], transform_train)
+        unlabel_dataset = CIFAR_unlabel(asm_result['unlabelset'][0], asm_result['unlabelset'][1])
+    else:
+        print('begin asm train')  # split uc/hc in batch
+        label_dataset, unlabel_dataset = train_asm_epochs(label_dataset, unlabel_dataset)
+
+    print(f'Finish asm train, best acc: {best_acc}, best epoch: {best_epoch}')
+
+    # finetune train
+    print('begin finetune train')
+    train_finetune_epochs(best_model, prefix='Finetune', ckpt='finetune_model.pth')
+    print(f'Finish finetune train, best acc: {best_acc}, best epoch: {best_epoch}')
