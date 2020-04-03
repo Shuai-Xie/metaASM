@@ -22,6 +22,8 @@ class Padam(Optimizer):
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad, partial=partial)
+
+        # set param here
         super(Padam, self).__init__(params, defaults)
 
     def step(self, closure=None):
@@ -39,8 +41,10 @@ class Padam(Optimizer):
                 if p.grad is None:
                     continue
                 grad = p.grad.data
+
                 if grad.is_sparse:
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+
                 amsgrad = group['amsgrad']
                 partial = group['partial']
 

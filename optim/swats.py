@@ -27,11 +27,15 @@ class SWATS(Optimizer):
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(
                 "Invalid beta parameter at index 1: {}".format(betas[1]))
+
         defaults = dict(lr=lr, betas=betas, eps=eps, phase='ADAM',
                         weight_decay=weight_decay, amsgrad=amsgrad,
                         verbose=verbose, nesterov=nesterov)
 
         super().__init__(params, defaults)
+        # param_groups = list(params)
+        # params: model.params()  # orderdict
+        # defaults: other hyper-params
 
     def __setstate__(self, state):
         super().__setstate__(state)
@@ -69,15 +73,15 @@ class SWATS(Optimizer):
                 # state initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    # exponential moving average of gradient values
+                    # exponential moving average of gradient values, m_k
                     state['exp_avg'] = torch.zeros_like(w.data)
-                    # exponential moving average of squared gradient values
+                    # exponential moving average of squared gradient values, v_k
                     state['exp_avg_sq'] = torch.zeros_like(w.data)
                     # moving average for the non-orthogonal projection scaling
                     state['exp_avg2'] = w.new(1).fill_(0)
                     if amsgrad:
-                        # maintains max of all exp. moving avg.
-                        # of sq. grad. values
+                        # maintains max of all exp. moving avg. of sq. grad. values
+                        # max
                         state['max_exp_avg_sq'] = torch.zeros_like(w.data)
 
                 exp_avg, exp_avg2, exp_avg_sq = \
@@ -95,11 +99,10 @@ class SWATS(Optimizer):
                 # if its SGD phase, take an SGD update and continue
                 if group['phase'] == 'SGD':
                     if 'momentum_buffer' not in state:
-                        buf = state['momentum_buffer'] = torch.clone(
-                            grad).detach()
+                        buf = state['momentum_buffer'] = torch.clone(grad).detach()
                     else:
                         buf = state['momentum_buffer']
-                        buf.mul_(beta1).add_(grad)
+                        buf.mul_(beta1).add_(grad)  # v_k
                         grad = buf
 
                     grad.mul_(1 - beta1)
