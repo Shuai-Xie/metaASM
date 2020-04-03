@@ -83,7 +83,7 @@ def asm_split_hc_delta_uc_K(model, input, target,
     """
     model.eval()
     # np
-    input, target = input.numpy().astype('uint8'), target.numpy().astype('int64')
+    # input, target = input.numpy().astype('uint8'), target.numpy().astype('int64')
 
     # tensor
     input_var = cvt_input_var(input, train=False)  # transfrom test
@@ -91,7 +91,7 @@ def asm_split_hc_delta_uc_K(model, input, target,
     # infer on batch input unlabel data
     outputs = model(input_var)
     probs = F.softmax(outputs, dim=-1)
-    probs = to_numpy(probs)  # =0?
+    probs = to_numpy(probs)
 
     # hc
     hc_idxs, hc_preds = get_hc_samples(probs, hc_delta)

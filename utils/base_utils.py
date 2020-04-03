@@ -2,6 +2,8 @@ import torch
 from torch.autograd import Variable
 import time
 import numpy as np
+from operator import mul
+from functools import reduce
 
 
 class AverageMeter:
@@ -47,6 +49,10 @@ class AccCaches:
 
 def cvt_iter_to_list(iter, type):
     return [type(v) for v in iter]
+
+
+def get_list_mul(li):
+    return reduce(mul, li) if len(li) > 0 else 0
 
 
 def cmp_two_list(l1, l2):
