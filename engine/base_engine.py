@@ -13,7 +13,11 @@ def update_lr(lr, epoch):
 
 def set_lr(lr, optimizer):
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group['lr'] = lr  # 可直接修改 optimizer 参数；可修改 partial
+
+
+def get_lr(optimizer):
+    return optimizer.param_groups[0]['lr']  # list[dict{'lr'}]
 
 
 def adjust_lr(lr, optimizer, epoch, writer):
@@ -119,3 +123,5 @@ def train_base(train_loader, model, criterion,
     if writer:
         writer.add_scalar(f'{prefix}/train_loss_epoch', losses.avg, global_step=epoch)
         writer.add_scalar(f'{prefix}/train_acc', top1.avg, global_step=epoch)
+
+    return losses.avg, top1.avg
